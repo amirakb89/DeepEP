@@ -3,12 +3,13 @@
 #include "exception.cuh"
 #include "launch.cuh"
 #include "utils.cuh"
+#include "shmem_wrapper.cuh"
 
 namespace deep_ep {
 
 namespace internode {
 
-extern nvshmem_team_t cpu_rdma_team;
+extern shmem_team_t cpu_rdma_team;
 
 template<int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
 __global__ void __launch_bounds__(kNumThreads, 1)
@@ -130,7 +131,7 @@ void get_dispatch_layout(const int64_t* topk_idx,
     EP_STATIC_ASSERT(kNumExpertsPerSM % NUM_MAX_NVL_PEERS == 0, "Invalid number of experts per SM");
 
     SETUP_LAUNCH_CONFIG(num_sms, kNumThreads, stream);
-    LAUNCH_KERNEL(&cfg, (get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>),
+    LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, (get_dispatch_layout<kNumThreads, kNumExpertsPerSM, kNumRanksPerSM>),
                   topk_idx, num_tokens_per_rank, num_tokens_per_rdma_rank, num_tokens_per_expert, is_token_in_rank,
                   num_tokens, num_topk, num_ranks, num_experts);
 }
@@ -192,8 +193,10 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
 }
 
 template <bool kLowLatencyMode>
-__forceinline__ __device__ void nvshmem_barrier_with_same_gpu_idx(const nvshmem_team_t& rdma_team) {
-    kLowLatencyMode ? void(nvshmem_barrier(rdma_team)) : nvshmem_barrier_all();
+__forceinline__ __device__ void nvshmem_barrier_with_same_gpu_idx(const shmem_team_t& rdma_team) {
+    // NOTE: shmem_device_barrier_all() might be an issue as 
+    // it doesn't follow OpenSHMEM specification on ROCm
+    kLowLatencyMode ? void(shmem_barrier(rdma_team)) : shmem_device_barrier_all();
 }
 
 template <bool kLowLatencyMode, int kNumRDMARanks>
@@ -208,10 +211,10 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 int* gbl_channel_prefix_matrix, int* recv_gbl_rank_prefix_sum,
                 void* rdma_buffer_ptr,
                 void** buffer_ptrs, int** task_fifo_ptrs, int head, int rank,
-                const nvshmem_team_t rdma_team) {
+                const shmem_team_t rdma_team) {
     auto sm_id = static_cast<int>(blockIdx.x);
-    auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
-    auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
+    auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / kWarpSize, lane_id = get_lane_id();
+    auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / kWarpSize;
 
     auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     auto num_rdma_experts = num_experts / kNumRDMARanks, num_nvl_experts = num_rdma_experts / NUM_MAX_NVL_PEERS;
@@ -221,8 +224,9 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // Global barrier: the first warp do intra-node sync, the second warp do internode sync
         EP_DEVICE_ASSERT(num_warps > 1);
         EP_DEVICE_ASSERT(kNumRDMARanks <= num_threads);
-        if (thread_id == 32)
+        if (thread_id == kWarpSize)
             nvshmem_barrier_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+
         barrier_device<NUM_MAX_NVL_PEERS>(task_fifo_ptrs, head, nvl_rank);
         move_fifo_slots<NUM_MAX_NVL_PEERS>(head);
         __syncthreads();
@@ -252,13 +256,14 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
         // TODO: more light fence or barrier or signaling
         // TODO: overlap EP barrier and NVL cleaning
         if (thread_id < kNumRDMARanks) {
-            nvshmem_int_put_nbi(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank), rdma_recv_num_tokens_mixed.send_buffer(thread_id),
+            shmem_int_put_nbi(rdma_recv_num_tokens_mixed.recv_buffer(rdma_rank), rdma_recv_num_tokens_mixed.send_buffer(thread_id),
                                 NUM_MAX_NVL_PEERS + num_rdma_experts + 1,
                                 translate_dst_rdma_rank<kLowLatencyMode>(thread_id, nvl_rank));
         }
         __syncthreads();
         if (thread_id == 0)
             nvshmem_barrier_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+
         __syncthreads();
 
         // NVL buffers
@@ -343,8 +348,9 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
 
         // Finally barrier
         __syncthreads();
-        if (thread_id == 32)
+        if (thread_id == kWarpSize)
             nvshmem_barrier_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+
         barrier_device<NUM_MAX_NVL_PEERS>(task_fifo_ptrs, head, nvl_rank);
         move_fifo_slots<NUM_MAX_NVL_PEERS>(head);
     } else {
@@ -356,7 +362,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
 
             // Iterate over tokens
             int total_count = 0, per_nvl_rank_count[NUM_MAX_NVL_PEERS] = {0};
-            for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += 32) {
+            for (int64_t i = token_start_idx + lane_id; i < token_end_idx; i += kWarpSize) {
                 EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
                 auto is_token_in_rank_uint64 = *reinterpret_cast<const uint64_t*>(is_token_in_rank + i * num_ranks + dst_rdma_rank * NUM_MAX_NVL_PEERS);
                 auto is_token_in_rank_values = reinterpret_cast<const bool*>(&is_token_in_rank_uint64);
@@ -390,7 +396,7 @@ notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mapped, in
                 prefix_row[i] += prefix_row[i - 1];
         }
 
-        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 32, "Invalid number of NVL peers");
+        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= kWarpSize, "Invalid number of NVL peers");
         if (thread_id < NUM_MAX_NVL_PEERS) {
             auto prefix_row = gbl_channel_prefix_matrix + (dst_rdma_rank * NUM_MAX_NVL_PEERS + thread_id) * num_channels;
             #pragma unroll
@@ -415,7 +421,7 @@ void notify_dispatch(const int* num_tokens_per_rank, int* moe_recv_counter_mappe
 #define NOTIFY_DISPATCH_LAUNCH_CASE(num_rdma_ranks) { \
     auto notify_dispatch_func = low_latency_mode ? \
         notify_dispatch<true, num_rdma_ranks> : notify_dispatch<false, num_rdma_ranks>; \
-    LAUNCH_KERNEL(&cfg, notify_dispatch_func, \
+    LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, notify_dispatch_func, \
                   num_tokens_per_rank, moe_recv_counter_mapped, num_ranks, \
                   num_tokens_per_rdma_rank, moe_recv_rdma_counter_mapped, \
                   num_tokens_per_expert, moe_recv_expert_counter_mapped, num_experts, \
@@ -452,7 +458,7 @@ constexpr int get_num_topk_rdma_ranks(int num_rdma_ranks) {
 
 template <bool kLowLatencyMode, int kNumRDMARanks, bool kCachedMode,
           int kNumDispatchRDMASenderWarps, int kNumTopkRDMARanks = get_num_topk_rdma_ranks(kNumRDMARanks)>
-__global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32), 1)
+__global__ void __launch_bounds__(((kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * kWarpSize), 1)
 dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv_topk_weights, SourceMeta* recv_src_meta,
          const int4* x, const float* x_scales, const int64_t* topk_idx, const float* topk_weights,
          int* send_rdma_head, int* send_nvl_head,
@@ -472,9 +478,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         kNVLReceivers
     };
 
+#if !defined(ROCM_DISABLE_CTX)
+    __shared__ shmem_ctx_t ctx;
+    shmem_wg_ctx_create(&ctx);
+#endif
+
     const auto sm_id = static_cast<int>(blockIdx.x);
-    const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
-    const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
+    const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / kWarpSize;
+    const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / kWarpSize, lane_id = get_lane_id();
     const auto num_channels = static_cast<int>(gridDim.x) / 2, channel_id = sm_id / 2;
     const bool is_forwarder = sm_id % 2 == 0;
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
@@ -494,12 +505,13 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             return {WarpRole::kNVLReceivers, (warp_id + channel_id - kNumDispatchRDMASenderWarps) % NUM_MAX_NVL_PEERS};
         }
     }();
+
     auto warp_role = role_meta.first;
     auto target_rank = role_meta.second; // Not applicable for RDMA senders
     EP_DEVICE_ASSERT(num_warps == kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS);
 
     // Data checks
-    EP_DEVICE_ASSERT(num_topk <= 32);
+    EP_DEVICE_ASSERT(num_topk <= kWarpSize);
 
     // RDMA symmetric layout
     EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * sizeof(bool) == sizeof(uint64_t), "Invalid number of NVL peers");
@@ -534,12 +546,44 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
     __shared__ volatile int rdma_send_next_token_idx;
     __shared__ volatile int rdma_send_channel_tail[kNumRDMARanks];
     __shared__ volatile int rdma_send_channel_next_tail[kNumRDMARanks];
-    auto sync_rdma_sender_smem = []() { asm volatile("bar.sync 0, %0;" :: "r"((kNumDispatchRDMASenderWarps + 1) * 32)); };
+#ifdef USE_ROCM
+    __shared__ volatile int rdma_sender_counter[1];
+    __shared__ volatile int rdma_forwarder_counter[1];
+    if (threadIdx.x==0){
+        rdma_sender_counter[0]=0;
+        rdma_forwarder_counter[0]=0;
+    }
+    __syncthreads();
+#endif
+
+    auto sync_rdma_sender_smem = [&]() {
+#ifdef USE_ROCM
+    if (lane_id==0) {
+        volatile int ret = __hip_atomic_fetch_add(&rdma_sender_counter[0], 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    }
+    syncwarp();
+    while(rdma_sender_counter[0]<(kNumDispatchRDMASenderWarps+1)){}
+#else
+asm volatile(
+          "bar.sync 0, %0;" ::"r"((kNumDispatchRDMASenderWarps + 1) * 32));
+#endif
+    };
 
     // Forward warp synchronization
     __shared__ volatile int forward_channel_head[NUM_MAX_NVL_PEERS][kNumRDMARanks];
     __shared__ volatile bool forward_channel_retired[NUM_MAX_NVL_PEERS];
-    auto sync_forwarder_smem = []() { asm volatile("bar.sync 1, %0;" :: "r"((NUM_MAX_NVL_PEERS + 1) * 32)); };
+    // NOTE: Not sure that __syncthreads() is a suitable replacement
+    auto sync_forwarder_smem = [&]() {
+#ifdef USE_ROCM
+    if (lane_id==0) {
+        volatile int ret = __hip_atomic_fetch_add(&rdma_forwarder_counter[0], 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    }
+    syncwarp();
+    while(rdma_forwarder_counter[0]<(NUM_MAX_NVL_PEERS + 1)){}
+#else
+        asm volatile("bar.sync 1, %0;" :: "r"((NUM_MAX_NVL_PEERS + 1) * 32));
+#endif
+    };
 
     if (warp_role == WarpRole::kRDMASender) {
         // Get tasks
@@ -547,13 +591,13 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         get_channel_task_range(num_tokens, num_channels, channel_id, token_start_idx, token_end_idx);
 
         // Clean shared memory
-        EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA ranks");
+        EP_STATIC_ASSERT(kNumRDMARanks <= kWarpSize, "Invalid number of RDMA ranks");
         (warp_id == 0 and lane_id == 0) ? (rdma_send_next_token_idx = token_start_idx) : 0;
         (warp_id == 0 and lane_id < kNumRDMARanks) ? (rdma_send_channel_tail[lane_id] = 0) : 0;
         (warp_id == 0 and lane_id < kNumRDMARanks) ? (rdma_send_channel_next_tail[lane_id] = 0) : 0;
 
         // Send number of tokens in this channel by `-value - 1`
-        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= 32, "Invalid number of NVL peers");
+        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS * 2 + 2 <= kWarpSize, "Invalid number of NVL peers");
         for (int dst_rdma_rank = warp_id; dst_rdma_rank < kNumRDMARanks; dst_rdma_rank += kNumDispatchRDMASenderWarps) {
             if (lane_id < NUM_MAX_NVL_PEERS) {
                 rdma_channel_meta.send_buffer(dst_rdma_rank)[lane_id] = -(channel_id == 0 ? 0 : gbl_channel_prefix_matrix[(dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_channels + channel_id - 1]) - 1;
@@ -564,10 +608,22 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             } else if (lane_id == NUM_MAX_NVL_PEERS * 2 + 1) {
                 rdma_channel_meta.send_buffer(dst_rdma_rank)[lane_id] = -rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + channel_id] - 1;
             }
-            nvshmemx_int_put_nbi_warp(rdma_channel_meta.recv_buffer(rdma_rank), rdma_channel_meta.send_buffer(dst_rdma_rank), NUM_MAX_NVL_PEERS * 2 + 2,
-                                      translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
+#if defined(ROCM_DISABLE_CTX)
+            shmemx_int_put_nbi_warp(
+#else
+            shmem_ctx_int_put_nbi_warp(ctx,
+#endif
+                rdma_channel_meta.recv_buffer(rdma_rank),
+                rdma_channel_meta.send_buffer(dst_rdma_rank),
+                NUM_MAX_NVL_PEERS * 2 + 2,
+                translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank,
+                                                         nvl_rank));
         }
-        nvshmem_fence();
+#if defined(ROCM_DISABLE_CTX)
+        shmem_fence();
+#else
+        shmem_ctx_quiet(ctx);
+#endif
         sync_rdma_sender_smem();
 
         // Iterate over tokens and copy into buffer
@@ -582,7 +638,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Acquire sequential lock
             while (lane_id == 0 and rdma_send_next_token_idx != token_idx);
-            __syncwarp();
+            syncwarp();
 
             // Acquire next tail
             int rdma_tail_idx = -1;
@@ -591,7 +647,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 while (rdma_tail_idx - cached_rdma_channel_head >= num_max_rdma_chunked_recv_tokens)
                     cached_rdma_channel_head = static_cast<int>(ld_volatile_global(rdma_channel_head.buffer(lane_id)));
             }
-            __syncwarp();
+            syncwarp();
 
             // Store RDMA head for combine
             if (lane_id < kNumRDMARanks and not kCachedMode)
@@ -610,7 +666,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             int num_topk_ranks = 0, topk_ranks[kNumTopkRDMARanks];
             void* dst_send_buffers[kNumTopkRDMARanks];
             #pragma unroll
-            for (int i = 0, slot_idx; i < kNumRDMARanks; ++ i) if ((slot_idx = __shfl_sync(0xffffffff, rdma_tail_idx, i)) >= 0) {
+            for (int i = 0, slot_idx; i < kNumRDMARanks; ++ i) if ((slot_idx = shfl_sync(rdma_tail_idx, i)) >= 0) {
                 slot_idx = slot_idx % num_max_rdma_chunked_recv_tokens;
                 topk_ranks[num_topk_ranks] = i;
                 auto recv_is_token_in_rank_uint64 = broadcast(is_token_in_rank_uint64, i);
@@ -641,7 +697,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Copy `x_scales` into symmetric send buffer
             #pragma unroll
-            for (int i = lane_id; i < num_scales; i += 32) {
+            for (int i = lane_id; i < num_scales; i += kWarpSize) {
                 auto value = ld_nc_global(x_scales + token_idx * num_scales + i);
                 #pragma unroll
                 for (int j = 0; j < num_topk_ranks; ++ j)
@@ -653,7 +709,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
             // Copy `topk_idx` and `topk_weights` into symmetric send buffer
             #pragma unroll
-            for (int i = lane_id; i < num_topk * num_topk_ranks; i += 32) {
+            for (int i = lane_id; i < num_topk * num_topk_ranks; i += kWarpSize) {
                 auto rank_idx = i / num_topk, copy_idx = i % num_topk;
                 auto idx_value = static_cast<int>(ld_nc_global(topk_idx + token_idx * num_topk + copy_idx));
                 auto weight_value = ld_nc_global(topk_weights + token_idx * num_topk + copy_idx);
@@ -665,7 +721,7 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         // Epilogue
         // Acquire sequential lock
         while (lane_id == 0 and rdma_send_next_token_idx != token_idx);
-        __syncwarp();
+        syncwarp();
 
         // Update last token tail
         if (last_rdma_tail_idx >= 0)
@@ -690,15 +746,15 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
         // Iterate all RDMA ranks
         int last_issued_tail = 0;
-        while (__any_sync(0xffffffff, num_tokens_to_send > 0)) {
+        while (__any_sync(kFullWarpMask, num_tokens_to_send > 0)) {
             for (int i = 0, synced_num_tokens_to_send; i < kNumRDMARanks; ++ i) {
                 int dst_rdma_rank = (i + channel_id) % kNumRDMARanks;
-                synced_num_tokens_to_send = __shfl_sync(0xffffffff, num_tokens_to_send, dst_rdma_rank);
+                synced_num_tokens_to_send = shfl_sync(num_tokens_to_send, dst_rdma_rank);
                 if (synced_num_tokens_to_send == 0)
                     continue;
 
                 // Read progress
-                auto synced_last_issued_tail = __shfl_sync(0xffffffff, last_issued_tail, dst_rdma_rank);
+                auto synced_last_issued_tail = shfl_sync(last_issued_tail, dst_rdma_rank);
                 auto processed_tail = ld_acquire_cta(const_cast<const int*>(rdma_send_channel_tail + dst_rdma_rank));
                 auto num_tokens_processed = processed_tail - synced_last_issued_tail;
                 if (num_tokens_processed != synced_num_tokens_to_send and num_tokens_processed < num_max_rdma_chunked_send_tokens)
@@ -710,23 +766,42 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 if (dst_rdma_rank != rdma_rank) {
                     auto dst_slot_idx = synced_last_issued_tail % num_max_rdma_chunked_recv_tokens;
                     EP_DEVICE_ASSERT(dst_slot_idx + num_tokens_to_issue <= num_max_rdma_chunked_recv_tokens);
-                    nvshmemx_int8_put_nbi_warp(rdma_channel_data.recv_buffer(rdma_rank) + dst_slot_idx * num_bytes_per_rdma_token,
-                                               rdma_channel_data.send_buffer(dst_rdma_rank) + dst_slot_idx * num_bytes_per_rdma_token,
-                                               num_bytes_per_rdma_token * num_tokens_to_issue,
-                                               translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
-                    nvshmem_fence();
+#if defined(ROCM_DISABLE_CTX)
+                    shmemx_int8_put_nbi_warp(
+#else
+                    shmem_ctx_schar_put_nbi_warp(ctx,
+#endif
+                        rdma_channel_data.recv_buffer(rdma_rank) +
+                            dst_slot_idx * num_bytes_per_rdma_token,
+                        rdma_channel_data.send_buffer(dst_rdma_rank) +
+                            dst_slot_idx * num_bytes_per_rdma_token,
+                        num_bytes_per_rdma_token * num_tokens_to_issue,
+                        translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank,
+                                                                 nvl_rank));
+#if defined(ROCM_DISABLE_CTX)
+                    shmem_fence();
+#else
+                    shmem_ctx_quiet(ctx);
+#endif
                 } else {
                     // Lighter fence for local RDMA rank
                     memory_fence();
                 }
 
                 // Update tails
-                __syncwarp();
+                syncwarp();
                 if (lane_id == dst_rdma_rank) {
                     last_issued_tail += num_tokens_to_issue;
                     num_tokens_to_send -= num_tokens_to_issue;
-                    nvshmemx_signal_op(rdma_channel_tail.buffer(rdma_rank), num_tokens_to_issue, NVSHMEM_SIGNAL_ADD,
-                                       translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
+#if defined(ROCM_DISABLE_CTX)
+                    shmem_signal_op_add(
+#else
+                    shmem_ctx_ulong_atomic_add(ctx,
+#endif
+                        rdma_channel_tail.buffer(rdma_rank),
+                        num_tokens_to_issue,
+                        translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank,
+                                                                 nvl_rank));
                 }
             }
         }
@@ -739,8 +814,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
 
         // Wait counters to arrive
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
-        EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
-        auto start_time = clock64();
+        EP_DEVICE_ASSERT(kNumRDMARanks <= kWarpSize);
+        auto start_time = wall_clock64();
         if (lane_id < kNumRDMARanks) {
             while (true) {
                 auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
@@ -766,15 +841,15 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 }
 
                 // Timeout check
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch forwarder timeout (RDMA meta), channel: %d, RDMA: %d, nvl: %d, src RDMA lane: %d, dst NVL: %d, meta: %d, %d, %d, %d\n",
                            channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank, meta_0, meta_1, meta_2, meta_3);
                     trap();
                 }
             }
         }
-        __syncwarp();
-
+        syncwarp();
         // Shift cached head
         send_nvl_head += src_rdma_channel_prefix * NUM_MAX_NVL_PEERS + dst_nvl_rank;
 
@@ -786,9 +861,9 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         int src_rdma_rank = sm_id % kNumRDMARanks;
         int cached_rdma_channel_head = 0, cached_rdma_channel_tail = 0;
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
-        while (__any_sync(0xffffffff, num_tokens_to_recv_from_rdma > 0)) {
+        while (__any_sync(kFullWarpMask, num_tokens_to_recv_from_rdma > 0)) {
             // Check destination queue emptiness, or wait a buffer to be released
-            start_time = clock64();
+            start_time = wall_clock64();
             while (lane_id == 0) {
                 int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                 if (num_max_nvl_chunked_recv_tokens - num_used_slots >= num_max_nvl_chunked_send_tokens)
@@ -796,34 +871,36 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 cached_nvl_channel_head = ld_volatile_global(nvl_channel_head.buffer());
 
                 // Timeout check
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, ld_volatile_global(nvl_channel_head.buffer()), cached_nvl_channel_tail);
                     trap();
                 }
             }
-            __syncwarp();
+            syncwarp();
 
             // Find next source RDMA rank (round-robin)
-            start_time = clock64();
+            start_time = wall_clock64();
             while (true) {
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
-                if (__shfl_sync(0xffffffff, num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
+                if (shfl_sync(num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
-                        cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
-                    if (__shfl_sync(0xffffffff, cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
+                        cached_rdma_channel_tail = static_cast<int>(ld_relaxed_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                    if (shfl_sync(cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
                 }
 
                 // Timeout check
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
+                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
                     printf("DeepEP dispatch forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, src RDMA lane: %d, head: %d, tail: %d, expected: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id, cached_rdma_channel_head, cached_rdma_channel_tail, num_tokens_to_recv_from_rdma);
                     trap();
                 }
             }
-            auto src_rdma_head = __shfl_sync(0xffffffff, cached_rdma_channel_head, src_rdma_rank);
-            auto src_rdma_tail = __shfl_sync(0xffffffff, cached_rdma_channel_tail, src_rdma_rank);
+            auto src_rdma_head = shfl_sync(cached_rdma_channel_head, src_rdma_rank);
+            auto src_rdma_tail = shfl_sync(cached_rdma_channel_tail, src_rdma_rank);
 
             // Iterate over every token from the RDMA buffer
             for (int i = src_rdma_head, num_tokens_sent = 0; i < src_rdma_tail; ++ i) {
@@ -888,13 +965,13 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
                 forward_channel_head[dst_nvl_rank][src_rdma_rank] = (cached_rdma_channel_head = src_rdma_tail);
 
             // Move tail index
-            __syncwarp();
+            syncwarp();
             if (lane_id == 0)
-                st_release_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
+                st_relaxed_sys_global(nvl_channel_tail.buffer(), cached_nvl_channel_tail);
         }
 
         // Retired
-        __syncwarp();
+        syncwarp();
         if (lane_id == 0)
             forward_channel_retired[dst_nvl_rank] = true;
     } else if (warp_role == WarpRole::kForwarderCoordinator) {
@@ -903,12 +980,12 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             return;
 
         // Forward warp coordinator
-        EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
+        EP_STATIC_ASSERT(kNumRDMARanks <= kWarpSize, "Invalid number of RDMA peers");
 
         // Clean shared memory
-        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 32, "Invalid number of NVL peers");
+        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= kWarpSize, "Invalid number of NVL peers");
         #pragma unroll
-        for (int i = lane_id; i < kNumRDMARanks * NUM_MAX_NVL_PEERS; i += 32)
+        for (int i = lane_id; i < kNumRDMARanks * NUM_MAX_NVL_PEERS; i += kWarpSize)
             forward_channel_head[i % NUM_MAX_NVL_PEERS][i / NUM_MAX_NVL_PEERS] = 0;
         if (lane_id < NUM_MAX_NVL_PEERS)
             forward_channel_retired[lane_id] = false;
@@ -921,30 +998,41 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             #pragma unroll
             for (int i = 0; i < NUM_MAX_NVL_PEERS; ++ i) if (not forward_channel_retired[i])
                 min_head = min(min_head, forward_channel_head[i][target_rdma]);
-            if (__all_sync(0xffffffff, min_head == std::numeric_limits<int>::max()))
+            if (__all_sync(kFullWarpMask, min_head == std::numeric_limits<int>::max()))
                 break;
 
             // Update remote head
-            if (min_head != std::numeric_limits<int>::max() and min_head >= last_head + num_max_rdma_chunked_send_tokens and lane_id < kNumRDMARanks) {
-                nvshmemx_signal_op(rdma_channel_head.buffer(rdma_rank), min_head - last_head, NVSHMEM_SIGNAL_ADD,
-                                   translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank));
-                last_head = min_head;
+            if (min_head != std::numeric_limits<int>::max() and
+                min_head >= last_head + num_max_rdma_chunked_send_tokens and
+                lane_id < kNumRDMARanks) {
+#if defined(ROCM_DISABLE_CTX)
+                shmem_signal_op_add(
+#else
+                shmem_ctx_ulong_atomic_add(ctx,
+#endif
+                  rdma_channel_head.buffer(rdma_rank), min_head - last_head,
+                  translate_dst_rdma_rank<kLowLatencyMode>(lane_id, nvl_rank));
+              last_head = min_head;
             }
 
             // Nanosleep and let other warps work
+#ifndef USE_ROCM
             __nanosleep(NUM_WAIT_NANOSECONDS);
+#else
+            __builtin_amdgcn_s_sleep(NUM_WAIT_CYCLES_TIMES_64);
+#endif
         }
     } else {
         // NVL consumers
         // Retrieve rank offset from barrier results (each lane's register stores an RDMA rank)
         int src_nvl_rank = target_rank, total_offset = 0;
-        EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
+        EP_STATIC_ASSERT(kNumRDMARanks <= kWarpSize, "Invalid number of RDMA peers");
         if (lane_id < kNumRDMARanks and lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank > 0)
             total_offset = recv_gbl_rank_prefix_sum[lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank - 1];
 
         // Receive channel offsets
         int start_offset = 0, end_offset = 0, num_tokens_to_recv;
-        auto start_time = clock64();
+        auto start_time = wall_clock64();
         while (lane_id < kNumRDMARanks) {
             start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
             end_offset = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
@@ -955,7 +1043,8 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
 
             // Timeout check
-            if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+            long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+            if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                 printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d, start: %d, end: %d\n",
                        channel_id, rdma_rank, nvl_rank, lane_id, src_nvl_rank, start_offset, end_offset);
                 trap();
@@ -966,20 +1055,21 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
         // Save for combine usage
         if (lane_id < kNumRDMARanks and not kCachedMode)
             recv_gbl_channel_prefix_matrix[(lane_id * NUM_MAX_NVL_PEERS + src_nvl_rank) * num_channels + channel_id] = total_offset;
-        __syncwarp();
+        syncwarp();
 
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
             // Check channel status by lane 0
-            start_time = clock64();
+            start_time = wall_clock64();
             while (lane_id == 0) {
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx)
                     break;
-                cached_channel_tail_idx = ld_acquire_sys_global(nvl_channel_tail.buffer());
+                cached_channel_tail_idx = ld_relaxed_sys_global(nvl_channel_tail.buffer());
 
                 // Timeout check
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                     printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d\n",
                            channel_id, rdma_rank, nvl_rank, src_nvl_rank, cached_channel_head_idx, cached_channel_tail_idx);
                     trap();
@@ -987,14 +1077,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
 
             // Sync queue tail
-            cached_channel_tail_idx = __shfl_sync(0xffffffff, cached_channel_tail_idx, 0);
+            cached_channel_tail_idx = shfl_sync(cached_channel_tail_idx, 0);
 
             // Copy data
             int num_recv_tokens = cached_channel_tail_idx - cached_channel_head_idx;
             for (int chunk_idx = 0; chunk_idx < num_recv_tokens; ++ chunk_idx, -- num_tokens_to_recv) {
                 int token_idx_in_buffer = (cached_channel_head_idx ++) % num_max_nvl_chunked_recv_tokens;
                 auto meta = ld_nc_global(nvl_channel_src_meta.buffer() + token_idx_in_buffer);
-                int64_t recv_token_idx = __shfl_sync(0xffffffff, total_offset, meta.src_rdma_rank);
+                int64_t recv_token_idx = shfl_sync(total_offset, meta.src_rdma_rank);
                 (lane_id == meta.src_rdma_rank) ? (total_offset += 1) : 0;
 
                 // Copy data
@@ -1023,11 +1113,14 @@ dispatch(int4* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv
             }
 
             // Move queue
-            __syncwarp();
+            syncwarp();
             if (lane_id == 0)
                 st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
         }
     }
+#if !defined(ROCM_DISABLE_CTX)
+    shmem_wg_ctx_destroy(&ctx);
+#endif
 }
 
 void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float* recv_topk_weights, void* recv_src_meta,
@@ -1048,7 +1141,7 @@ void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float*
     auto dispatch_func = low_latency_mode ? \
         (is_cached_dispatch ? dispatch<true, num_rdma_ranks, true, kNumDispatchRDMASenderWarps> : dispatch<true, num_rdma_ranks, false, kNumDispatchRDMASenderWarps>) : \
         (is_cached_dispatch ? dispatch<false, num_rdma_ranks, true, kNumDispatchRDMASenderWarps> : dispatch<false, num_rdma_ranks, false, kNumDispatchRDMASenderWarps>); \
-    LAUNCH_KERNEL(&cfg, dispatch_func, \
+    LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, dispatch_func, \
                   reinterpret_cast<int4*>(recv_x), recv_x_scales, recv_topk_idx, recv_topk_weights, reinterpret_cast<SourceMeta*>(recv_src_meta), \
                   reinterpret_cast<const int4*>(x), x_scales, topk_idx, topk_weights, \
                   send_rdma_head, send_nvl_head, \
@@ -1064,7 +1157,7 @@ void dispatch(void* recv_x, float* recv_x_scales, int64_t* recv_topk_idx, float*
     EP_HOST_ASSERT((topk_idx == nullptr)  == (topk_weights == nullptr));
     EP_HOST_ASSERT((recv_topk_idx == nullptr) == (recv_topk_weights == nullptr));
 
-    SETUP_LAUNCH_CONFIG(num_channels * 2, (kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * 32, stream);
+    SETUP_LAUNCH_CONFIG(num_channels * 2, (kNumDispatchRDMASenderWarps + 1 + NUM_MAX_NVL_PEERS) * kWarpSize, stream);
     SWITCH_RDMA_RANKS(DISPATCH_LAUNCH_CASE);
 #undef DISPATCH_LAUNCH_CASE
 }
@@ -1076,12 +1169,12 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
                               const int* rdma_channel_prefix_matrix, const int* rdma_rank_prefix_sum, int* combined_nvl_head,
                               void* rdma_buffer_ptr,
                               void** buffer_ptrs, int** task_fifo_ptrs, int head, int rank, int num_ranks,
-                              bool is_cached_dispatch, const nvshmem_team_t rdma_team) {
+                              bool is_cached_dispatch, const shmem_team_t rdma_team) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x);
     auto num_threads = static_cast<int>(blockDim.x);
-    auto num_warps = num_threads / 32;
-    auto warp_id = thread_id / 32;
+    auto num_warps = num_threads / kWarpSize;
+    auto warp_id = thread_id / kWarpSize;
     auto lane_id = get_lane_id();
 
     auto nvl_rank = rank % NUM_MAX_NVL_PEERS;
@@ -1092,6 +1185,7 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
         // Barrier for RDMA
         if (thread_id == 0)
             nvshmem_barrier_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+
         __syncthreads();
 
         // Clean
@@ -1099,12 +1193,13 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
         #pragma unroll
         for (int i = thread_id; i < rdma_num_int_clean; i += num_threads)
             rdma_buffer_ptr_int[rdma_clean_offset + i] = 0;
-        nvshmem_fence();
+        shmem_fence();
         __syncthreads();
 
         // Barrier again
         if (thread_id == 0)
             nvshmem_barrier_with_same_gpu_idx<kLowLatencyMode>(rdma_team);
+
     } else if (sm_id == 1) {
         // Barrier for NVL
         barrier_device<NUM_MAX_NVL_PEERS>(task_fifo_ptrs, head, nvl_rank);
@@ -1127,7 +1222,7 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
             return;
 
         EP_DEVICE_ASSERT(num_warps >= num_channels);
-        EP_DEVICE_ASSERT(num_rdma_ranks <= 32);
+        EP_DEVICE_ASSERT(num_rdma_ranks <= kWarpSize);
 
         // Iterate in reverse order
         if (lane_id < num_rdma_ranks and warp_id < num_channels) {
@@ -1151,7 +1246,7 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
 
         EP_DEVICE_ASSERT(num_warps >= num_channels);
         EP_DEVICE_ASSERT(rdma_channel_prefix_matrix != nullptr and rdma_rank_prefix_sum != nullptr);
-        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 32, "Too many NVL peers");
+        EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= kWarpSize, "Too many NVL peers");
 
         if (lane_id < NUM_MAX_NVL_PEERS and warp_id < num_channels) {
             for (int dst_rdma_rank = sm_id - 3; dst_rdma_rank < num_rdma_ranks; dst_rdma_rank += num_channels * 2 - 3) {
@@ -1185,7 +1280,7 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
                    int** task_fifo_ptrs, int head, int rank, cudaStream_t stream,
                    int64_t num_rdma_bytes, int64_t num_nvl_bytes,
                    bool is_cached_dispatch, bool low_latency_mode) {
-    const int num_threads = std::max(128, 32 * num_channels);
+    const int num_threads = std::max(128, kWarpSize * num_channels);
     const auto num_rdma_ranks = num_ranks / NUM_MAX_NVL_PEERS;
 
     // Get clean meta
@@ -1200,7 +1295,7 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
     // Launch kernel
     auto cached_notify_func = low_latency_mode ? cached_notify<true> : cached_notify<false>;
     SETUP_LAUNCH_CONFIG(num_channels * 2, num_threads, stream);
-    LAUNCH_KERNEL(&cfg, cached_notify_func,
+    LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, cached_notify_func,
                   rdma_clean_meta.first, rdma_clean_meta.second,
                   nvl_clean_meta.first, nvl_clean_meta.second,
                   combined_rdma_head, num_combined_tokens, num_channels,
@@ -1210,7 +1305,7 @@ void cached_notify(int hidden_int4, int num_scales, int num_topk_idx, int num_to
                   is_cached_dispatch, cpu_rdma_team);
 }
 
-template <int kNumRanks, typename dtype_t, int kMaxNumRanks, typename ReceiveFn, typename ReceiveTWFn>
+template <int kNumRanks, typename dtype_t, int kMaxNumRanks, int kWidth, typename ReceiveFn, typename ReceiveTWFn>
 __device__ int combine_token(bool is_token_in_rank, int head_idx,
                              int lane_id, int hidden_int4, int num_topk,
                              int4* combined_row, float* combined_topk_weights,
@@ -1219,41 +1314,40 @@ __device__ int combine_token(bool is_token_in_rank, int head_idx,
 
     // Broadcast current heads
     // Lane `i` holds the head of rank `i` and `is_token_in_rank`
-    EP_STATIC_ASSERT(kMaxNumRanks <= 32, "Too many ranks");
+    EP_STATIC_ASSERT(kMaxNumRanks <= kWidth, "Too many ranks");
     int num_topk_ranks = 0, topk_ranks[kMaxNumRanks], slot_indices[kMaxNumRanks];
     #pragma unroll
-    for (int i = 0; i < kNumRanks; ++ i) if (__shfl_sync(0xffffffff, is_token_in_rank, i)) {
-        slot_indices[num_topk_ranks] = __shfl_sync(0xffffffff, head_idx, i) % num_max_recv_tokens;
+    for (int i = 0; i < kNumRanks; ++ i) if (shfl_sync(is_token_in_rank, i, kWidth)) {
+        slot_indices[num_topk_ranks] = shfl_sync(head_idx, i, kWidth) % num_max_recv_tokens;
         topk_ranks[num_topk_ranks ++] = i;
     }
     EP_DEVICE_ASSERT(num_topk_ranks <= kMaxNumRanks);
 
-    // Reduce data
+    // Reduce data    
     #pragma unroll
-    for (int i = lane_id; i < hidden_int4; i += 32) {
-        // Read buffers
-        // TODO: maybe too many registers here
-        int4 recv_value_int4[kMaxNumRanks];
-        #pragma unroll
-        for (int j = 0; j < num_topk_ranks; ++ j)
-            recv_value_int4[j] = recv_fn(topk_ranks[j], slot_indices[j], i);
-
-        // Reduce all-to-all results
+    for (int i = lane_id; i < hidden_int4; i += kWidth) {
         float values[kDtypePerInt4] = {0};
+
+        // Temporary buffer
+        int4 temp;
+
         #pragma unroll
-        for (int j = 0; j < num_topk_ranks; ++ j) {
-            auto recv_value_dtypes = reinterpret_cast<const dtype_t*>(&recv_value_int4[j]);
+        for (int j = 0; j < num_topk_ranks; ++j) {
+            temp = recv_fn(topk_ranks[j], slot_indices[j], i);
+            const dtype_t* d = reinterpret_cast<const dtype_t*>(&temp);
+
             #pragma unroll
-            for (int k = 0; k < kDtypePerInt4; ++ k)
-                values[k] += static_cast<float>(recv_value_dtypes[k]);
+            for (int k = 0; k < kDtypePerInt4; ++k)
+                values[k] += static_cast<float>(d[k]);
         }
 
-        // Cast back to `dtype_t` and write
         int4 out_int4;
-        auto out_dtypes = reinterpret_cast<dtype_t*>(&out_int4);
+        dtype_t* out_dtypes = reinterpret_cast<dtype_t*>(&out_int4);
+
         #pragma unroll
-        for (int j = 0; j < kDtypePerInt4; ++ j)
+        for (int j = 0; j < kDtypePerInt4; ++j)
             out_dtypes[j] = static_cast<dtype_t>(values[j]);
+
         st_na_global(combined_row + i, out_int4);
     }
 
@@ -1277,7 +1371,7 @@ template<bool kLowLatencyMode,
          int kNumWarpsPerForwarder = (kNumCombineForwarderWarps / kNumRDMARanks > 0) ? kNumCombineForwarderWarps / kNumRDMARanks : 1,
          int kNumForwarders = kNumRDMARanks * kNumWarpsPerForwarder,
          int kNumRDMAReceivers = kNumForwarders + NUM_MAX_NVL_PEERS>
-__global__ void __launch_bounds__((NUM_MAX_NVL_PEERS + 1 + kNumForwarders) * 32, 1)
+__global__ void __launch_bounds__((NUM_MAX_NVL_PEERS + kNumForwarders) * kEmulatedWarpSize + kWarpSize, 1)
 combine(int4* combined_x, float* combined_topk_weights,
         const bool* is_combined_token_in_rank,
         const int4* x, const float* topk_weights,
@@ -1295,19 +1389,29 @@ combine(int4* combined_x, float* combined_topk_weights,
     };
 
     const auto sm_id = static_cast<int>(blockIdx.x);
-    const auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
-    const auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id();
+    const auto num_threads = static_cast<int>(blockDim.x);
+#if defined(USE_ROCM)
+    const auto num_warps = num_threads / kEmulatedWarpSize - 1;
+#else
+    const auto num_warps = num_threads / kEmulatedWarpSize;
+#endif
+    auto thread_id = static_cast<int>(threadIdx.x), lane_id = get_lane_id() % kEmulatedWarpSize;
     const auto num_channels = static_cast<int>(gridDim.x) / 2, channel_id = sm_id / 2;
     const bool is_rdma_receiver_sm = sm_id % 2 == 1;
 
-    EP_DEVICE_ASSERT(num_topk <= 32);
+#if !defined(ROCM_DISABLE_CTX)
+    __shared__ shmem_ctx_t ctx;
+    shmem_wg_ctx_create(&ctx);
+#endif
+
+    EP_DEVICE_ASSERT(num_topk <= kEmulatedWarpSize);
     EP_DEVICE_ASSERT(hidden % (sizeof(int4) / sizeof(dtype_t)) == 0);
     const auto hidden_int4 = hidden / (sizeof(int4) / sizeof(dtype_t));
 
     // NOTES: we decouple a channel into 2 SMs
     const auto rdma_rank = rank / NUM_MAX_NVL_PEERS, nvl_rank = rank % NUM_MAX_NVL_PEERS;
     auto role_meta = [=]() -> std::pair<WarpRole, int> {
-        auto warp_id = thread_id / 32;
+        auto warp_id = thread_id / kEmulatedWarpSize;
         if (not is_rdma_receiver_sm) {
             if (warp_id < NUM_MAX_NVL_PEERS) {
                 auto shuffled_warp_id = warp_id;
@@ -1334,6 +1438,23 @@ combine(int4* combined_x, float* combined_topk_weights,
     EP_DEVICE_ASSERT(num_warps == NUM_MAX_NVL_PEERS + kNumForwarders + 1);
     auto num_max_nvl_chunked_recv_tokens_per_rdma = num_max_nvl_chunked_recv_tokens / kNumRDMARanks;
 
+#ifdef USE_ROCM
+        // This approach is designed to sync multiple warps in a loop
+        constexpr int num_sync_large_iteration = 64;
+        __shared__ volatile int rdma_receiver_counter[1];
+        __shared__ volatile int rdma_forwarder_counter[1];
+        __shared__ volatile uint8_t sync_large_warp_counters[2 * kNumRDMARanks * num_sync_large_iteration ];
+        if (threadIdx.x==0){
+            rdma_receiver_counter[0] = 0;
+            rdma_forwarder_counter[0] = 0;
+        }
+        
+        for (int i = thread_id; i < 2 * kNumRDMARanks * num_sync_large_iteration; i += num_threads) {
+            sync_large_warp_counters[i] = 0;
+        }
+        
+        __syncthreads();
+#endif
     if (warp_role == WarpRole::kNVLSender) {
         // NVL producers
         const auto dst_nvl_rank = warp_id;
@@ -1354,48 +1475,56 @@ combine(int4* combined_x, float* combined_topk_weights,
             token_start_idx = gbl_channel_prefix_matrix[prefix_idx];
             token_end_idx = (prefix_idx == num_channels * num_ranks - 1) ? num_tokens : gbl_channel_prefix_matrix[prefix_idx + 1];
         }
-        __syncwarp();
+        syncwarp();
 
         // NOTES: here the cached value of each lane is only responsible for a single RDMA buffer
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
-        EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
+        EP_STATIC_ASSERT(kNumRDMARanks <= kEmulatedWarpSize, "Invalid number of RDMA peers");
 
         // Iterate over all tokens and send by chunks
         while (true) {
             // Exit if possible
-            if (__all_sync(0xffffffff, token_start_idx >= token_end_idx))
+            if (__all_sync(kFullWarpMask, token_start_idx >= token_end_idx))
                 break;
 
             // Decide next RDMA buffer to send
             bool is_lane_ready = false;
-            auto start_time = clock64();
+            auto start_time = wall_clock64();
             while (true) {
                 int num_used_slots = cached_channel_tail_idx - cached_channel_head_idx;
                 is_lane_ready = lane_id < kNumRDMARanks and token_start_idx < token_end_idx and num_max_nvl_chunked_recv_tokens_per_rdma - num_used_slots >= num_max_nvl_chunked_send_tokens;
-                if (__any_sync(0xffffffff, is_lane_ready))
+#if defined(USE_ROCM)
+                if(__any_sync(kFirstHalfMask, is_lane_ready))
                     break;
-
+                if(__any_sync(kSecondHalfMask, is_lane_ready))
+                    break;
+#else
+                if (__any_sync(kFullWarpMask, is_lane_ready))
+                    break;
+#endif
                 // Retry
                 if (lane_id < kNumRDMARanks and token_start_idx < token_end_idx)
                     cached_channel_head_idx = ld_volatile_global(nvl_channel_head.buffer() + lane_id);
 
                 // Timeout check
-                if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
+                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
                     printf("DeepEP combine NVL sender timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, RDMA lane: %d, head: %d, tail: %d, start: %d, end: %d\n",
                            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id, ld_volatile_global(nvl_channel_head.buffer() + lane_id), cached_channel_tail_idx,
                            token_start_idx, token_end_idx);
                     trap();
                 }
+                __builtin_amdgcn_s_sleep(1);
             }
 
             // Sync token start index and count
             for (int current_rdma_idx = 0; current_rdma_idx < kNumRDMARanks; ++ current_rdma_idx) {
-                if (__shfl_sync(0xffffffff, (token_start_idx >= token_end_idx) or (not is_lane_ready), current_rdma_idx))
+                if (shfl_sync((token_start_idx >= token_end_idx) or (not is_lane_ready), current_rdma_idx, kEmulatedWarpSize))
                     continue;
 
                 // Sync token start index
-                auto token_idx = static_cast<int64_t>(__shfl_sync(0xffffffff, token_start_idx, current_rdma_idx));
-                int num_tokens_in_chunk = __shfl_sync(0xffffffff, min(num_max_nvl_chunked_send_tokens, token_end_idx - token_start_idx), current_rdma_idx);
+                auto token_idx = static_cast<int64_t>(shfl_sync(token_start_idx, current_rdma_idx, kEmulatedWarpSize));
+                int num_tokens_in_chunk = shfl_sync(min(num_max_nvl_chunked_send_tokens, token_end_idx - token_start_idx), current_rdma_idx, kEmulatedWarpSize);
 
                 // Send by chunk
                 for (int chunk_idx = 0; chunk_idx < num_tokens_in_chunk; ++ chunk_idx, ++ token_idx) {
@@ -1405,15 +1534,15 @@ combine(int4* combined_x, float* combined_topk_weights,
                         dst_slot_idx = (cached_channel_tail_idx ++) % num_max_nvl_chunked_recv_tokens_per_rdma;
                         dst_slot_idx = current_rdma_idx * num_max_nvl_chunked_recv_tokens_per_rdma + dst_slot_idx;
                     }
-                    dst_slot_idx = __shfl_sync(0xffffffff, dst_slot_idx, current_rdma_idx);
+                    dst_slot_idx = shfl_sync(dst_slot_idx, current_rdma_idx, kEmulatedWarpSize);
 
                     // Copy data
                     auto shifted_x_buffers = nvl_channel_x.buffer() + dst_slot_idx * hidden_int4;
                     auto shifted_x = x + token_idx * hidden_int4;
-                    UNROLLED_WARP_COPY(5, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
+                    UNROLLED_WARP_COPY_EMULATED(5, lane_id, hidden_int4, shifted_x_buffers, shifted_x, ld_nc_global, st_na_global);
 
                     // Copy source meta
-                    if (lane_id == 0)
+                    if (lane_id == num_topk)
                         st_na_global(nvl_channel_src_meta.buffer() + dst_slot_idx, ld_nc_global(src_meta + token_idx));
 
                     // Copy `topk_weights`
@@ -1424,9 +1553,9 @@ combine(int4* combined_x, float* combined_topk_weights,
             }
 
             // Move queue tail
-            __syncwarp();
+            syncwarp();
             if (lane_id < kNumRDMARanks and is_lane_ready)
-                st_release_sys_global(nvl_channel_tail.buffer() + lane_id, cached_channel_tail_idx);
+                st_relaxed_sys_global(nvl_channel_tail.buffer() + lane_id, cached_channel_tail_idx);
         }
     } else {
         // Combiners and coordinators
@@ -1454,8 +1583,29 @@ combine(int4* combined_x, float* combined_topk_weights,
         __shared__ volatile bool forwarder_retired[kNumForwarders];
         __shared__ volatile int rdma_receiver_rdma_head[kNumRDMAReceivers][kNumRDMARanks];
         __shared__ volatile bool rdma_receiver_retired[kNumRDMAReceivers];
-        auto sync_forwarder_smem = [=]() { asm volatile("bar.sync 0, %0;" :: "r"((kNumForwarders + 1) * 32)); };
-        auto sync_rdma_receiver_smem = [=]() { asm volatile("bar.sync 1, %0;" :: "r"((kNumRDMAReceivers + 1) * 32)); };
+
+        auto sync_forwarder_smem = [&]() {
+#ifdef USE_ROCM
+        if (lane_id==0) {
+            volatile int ret = __hip_atomic_fetch_add(&rdma_forwarder_counter[0], 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+        }
+        syncwarp();
+        while(rdma_forwarder_counter[0]<(kNumForwarders + 1)){}
+#else 
+            asm volatile("bar.sync 0, %0;" :: "r"((kNumForwarders + 1) * 32)); 
+#endif
+        };
+        auto sync_rdma_receiver_smem = [&]() {
+#ifdef USE_ROCM
+    if (lane_id==0) {
+        volatile int ret = __hip_atomic_fetch_add(&rdma_receiver_counter[0], 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+    }
+    syncwarp();
+    while(rdma_receiver_counter[0]<(kNumRDMAReceivers+1)){}
+#else
+            asm volatile("bar.sync 1, %0;" :: "r"((kNumRDMAReceivers + 1) * 32)); 
+#endif
+        };
 
         if (warp_role == WarpRole::kNVLAndRDMAForwarder) {
             // Receive from NVL ranks and forward to RDMA ranks
@@ -1463,11 +1613,46 @@ combine(int4* combined_x, float* combined_topk_weights,
             const auto dst_rdma_rank = warp_id / kNumWarpsPerForwarder;
             const auto sub_warp_id = warp_id % kNumWarpsPerForwarder;
             auto send_buffer = dst_rdma_rank == rdma_rank ? rdma_channel_data.recv_buffer(dst_rdma_rank) : rdma_channel_data.send_buffer(dst_rdma_rank);
+#ifdef USE_ROCM
+            auto sync_large_warp = [=](const int iter, const int mode) {
+#else
+
             auto sync_large_warp = [=]() {
+#endif
                 if (kNumWarpsPerForwarder == 1) {
-                    __syncwarp();
+                    syncwarp();
                 } else {
+#ifdef USE_ROCM
+                        // LDS index to store for sync
+                        int lds_dst_rdma_rank = dst_rdma_rank + (iter % num_sync_large_iteration) * kNumRDMARanks + mode * kNumRDMARanks * num_sync_large_iteration;
+                        //reset index in the LDS to avoid race condition due to warp scheduling
+                        int reset_idx =         dst_rdma_rank + ((iter + num_sync_large_iteration/2) % num_sync_large_iteration) * kNumRDMARanks + mode * kNumRDMARanks * num_sync_large_iteration;
+                        // if (lane_id==0)
+                        //     printf("rank %d dst_rdma_rank %d iter %d  warp_id %d  val %d\n", rank, dst_rdma_rank, iter, warp_id, sync_large_warp_counters[lds_dst_rdma_rank]);
+                        auto start_time = clock64();
+                        if (lane_id == 0){
+                            volatile int ret = __hip_atomic_fetch_add(
+                                &sync_large_warp_counters[lds_dst_rdma_rank], 1,
+                                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+                        }
+                        syncwarp();
+                        //The while(...) loop polls the counter until all warps have arrived
+                        if (lane_id == 0){
+                            while (sync_large_warp_counters[lds_dst_rdma_rank] < (kNumWarpsPerForwarder)){
+                                if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                                    printf("DeepEP combine sync timeout. current num_sync_large_iteration %d. double it.\n", num_sync_large_iteration );
+                                    trap();
+                                }
+                            }
+                        }
+                        syncwarp();
+                        if (lane_id == 0 && sync_large_warp_counters[reset_idx] == kNumWarpsPerForwarder){
+                            sync_large_warp_counters[reset_idx] = 0;
+                        }
+                        syncwarp();
+#else
                     asm volatile("bar.sync %0, %1;" :: "r"(dst_rdma_rank + 2), "r"(kNumWarpsPerForwarder * 32));
+#endif
                 }
             };
             EP_STATIC_ASSERT(kNumWarpsPerForwarder == 1 or kNumRDMARanks + 2 <= 16, "Barriers are not enough");
@@ -1480,7 +1665,7 @@ combine(int4* combined_x, float* combined_topk_weights,
             nvl_channel_tail.advance(dst_rdma_rank);
 
             // Clean shared memory and sync
-            EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= 32, "Invalid number of NVL peers");
+            EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= kWarpSize, "Invalid number of NVL peers");
             lane_id < NUM_MAX_NVL_PEERS ? (forwarder_nvl_head[warp_id][lane_id] = 0) : 0;
             lane_id == 0 ? (forwarder_retired[warp_id] = false) : false;
             sync_forwarder_smem();
@@ -1498,7 +1683,7 @@ combine(int4* combined_x, float* combined_topk_weights,
                 // Check destination queue emptiness, or wait a buffer to be released
                 auto token_end_idx = min(token_start_idx + num_max_rdma_chunked_send_tokens, num_tokens_to_combine);
                 auto num_chunked_tokens = token_end_idx - token_start_idx;
-                auto start_time = clock64();
+                auto start_time = wall_clock64();
                 while (sub_warp_id == 0 and lane_id == 0) {
                     // Inequality: `num_max_rdma_chunked_recv_tokens - (tail - head) >= num_chunked_tokens`
                     // Here, `token_start_idx` is the actual tail
@@ -1507,33 +1692,39 @@ combine(int4* combined_x, float* combined_topk_weights,
                         break;
 
                     // Timeout check
-                    if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                    long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                    if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP combine forwarder (RDMA check) timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, head: %ld, tail: %d, chunked: %d\n",
                                channel_id, rdma_rank, nvl_rank, dst_rdma_rank, ld_volatile_global(rdma_channel_head.buffer(dst_rdma_rank)), token_start_idx, num_chunked_tokens);
                         trap();
                     }
                 }
+#ifdef USE_ROCM
+                sync_large_warp(token_start_idx, 0);
+#else
                 sync_large_warp();
-
+#endif
                 // Combine and write to the RDMA buffer
                 for (int token_idx = token_start_idx + sub_warp_id; token_idx < token_end_idx; token_idx += kNumWarpsPerForwarder) {
                     // Read expected head
-                    EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
+                    EP_STATIC_ASSERT(kNumRDMARanks <= kWarpSize, "Invalid number of RDMA peers");
                     int expected_head = -1;
                     if (lane_id < NUM_MAX_NVL_PEERS)
                         expected_head = ld_nc_global(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
 
                     // Wait lanes to be ready
-                    start_time = clock64();
+                    start_time = wall_clock64();
                     while (cached_nvl_channel_tail_idx <= expected_head) {
-                        cached_nvl_channel_tail_idx = ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
+                        cached_nvl_channel_tail_idx = ld_relaxed_sys_global(nvl_channel_tail.buffer(lane_id));
 
                         // Timeout check
-                        if (clock64() - start_time > NUM_TIMEOUT_CYCLES and lane_id < NUM_MAX_NVL_PEERS) {
+                        long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                        if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < NUM_MAX_NVL_PEERS) {
                             printf("DeepEP combine forwarder (NVL check) timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, dst RDMA: %d, tail: %d, waiting: %d, total: %d, sub: %d, large: %d, expected: %d\n",
                                    channel_id, rdma_rank, nvl_rank, lane_id, dst_rdma_rank, cached_nvl_channel_tail_idx, token_idx, num_tokens_to_combine, sub_warp_id, kNumWarpsPerForwarder, expected_head);
                             trap();
                         }
+                        __builtin_amdgcn_s_sleep(1);
                     }
 
                     // Combine current token
@@ -1541,48 +1732,68 @@ combine(int4* combined_x, float* combined_topk_weights,
                     void* shifted = send_buffer + rdma_slot_idx * num_bytes_per_rdma_token;
                     auto recv_fn = [&](int src_nvl_rank, int slot_idx, int hidden_int4_idx) -> int4 { return ld_nc_global(nvl_channel_x.buffer(src_nvl_rank) + slot_idx * hidden_int4 + hidden_int4_idx); };
                     auto recv_tw_fn = [&](int src_nvl_rank, int slot_idx, int topk_idx) -> float { return ld_nc_global(nvl_channel_topk_weights.buffer(src_nvl_rank) + slot_idx * num_topk + topk_idx); };
-                    combine_token<NUM_MAX_NVL_PEERS, dtype_t, NUM_MAX_NVL_PEERS>(expected_head >= 0,
-                                                                                 expected_head, lane_id,
-                                                                                 hidden_int4, num_topk,
-                                                                                 reinterpret_cast<int4*>(shifted),
-                                                                                 reinterpret_cast<float*>(reinterpret_cast<int8_t*>(shifted) + hidden_bytes + sizeof(SourceMeta)),
-                                                                                 num_max_nvl_chunked_recv_tokens_per_rdma, recv_fn, recv_tw_fn);
+                    combine_token<NUM_MAX_NVL_PEERS, dtype_t, NUM_MAX_NVL_PEERS, kEmulatedWarpSize>(expected_head >= 0,
+                                                                                     expected_head, lane_id,
+                                                                                     hidden_int4, num_topk,
+                                                                                     reinterpret_cast<int4*>(shifted),
+                                                                                     reinterpret_cast<float*>(reinterpret_cast<int8_t*>(shifted) + hidden_bytes + sizeof(SourceMeta)),
+                                                                                     num_max_nvl_chunked_recv_tokens_per_rdma, recv_fn, recv_tw_fn);
 
                     // Update head
                     if (lane_id < NUM_MAX_NVL_PEERS)
                         expected_head < 0 ? (forwarder_nvl_head[warp_id][lane_id] = -expected_head - 1) : (forwarder_nvl_head[warp_id][lane_id] = expected_head + 1);
                 }
+#ifdef USE_ROCM
+                sync_large_warp(token_start_idx, 1);
+#else
                 sync_large_warp();
-
+#endif
                 // Issue RDMA send
-                if (sub_warp_id == kNumWarpsPerForwarder - 1) {
+                // TODO: Switch back to put_nbi_wave function
+                if (sub_warp_id == kNumWarpsPerForwarder - 1 && lane_id == 0) {
                     if (dst_rdma_rank != rdma_rank) {
                         auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
-                        nvshmemx_int8_put_nbi_warp(rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
-                                                   rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
-                                                   num_chunked_tokens * num_bytes_per_rdma_token,
-                                                   translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
-                        nvshmem_fence();
+#if defined(ROCM_DISABLE_CTX)
+                        shmemx_int8_put_nbi_warp(
+#else
+                        rocshmem::rocshmem_ctx_schar_put_nbi(ctx,
+#endif
+                                                 rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
+                                                 rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
+                                                 num_chunked_tokens * num_bytes_per_rdma_token,
+                                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
+
+
+#if defined(ROCM_DISABLE_CTX)
+                        shmem_fence();
+#else
+                        shmem_ctx_quiet(ctx);
+#endif
                     } else {
                         memory_fence();
                     }
 
                     // Write new RDMA tail
-                    __syncwarp();
+                    syncwarp();
                     if (lane_id == 0)
-                        nvshmemx_signal_op(rdma_channel_tail.buffer(rdma_rank), num_chunked_tokens, NVSHMEM_SIGNAL_ADD,
+#if defined(ROCM_DISABLE_CTX)
+                        shmem_signal_op_add(
+#else
+                        rocshmem::rocshmem_ctx_ulong_atomic_add(ctx,
+#endif
+                                           rdma_channel_tail.buffer(rdma_rank), num_chunked_tokens,
                                            translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
                 }
             }
 
             // Retired
-            __syncwarp();
+            syncwarp();
             if (lane_id == 0)
                 forwarder_retired[warp_id] = true;
         } else if (warp_role == WarpRole::kRDMAReceiver) {
             // Receive from RDMA ranks and write to the output tensor
             // Clean shared memory and sync
-            EP_DEVICE_ASSERT(kNumRDMARanks <= 32);
+            EP_DEVICE_ASSERT(kNumRDMARanks <= kWarpSize);
             lane_id < kNumRDMARanks ? (rdma_receiver_rdma_head[warp_id][lane_id] = 0) : 0;
             lane_id == 0 ? (rdma_receiver_retired[warp_id] = false) : 0;
             sync_rdma_receiver_smem();
@@ -1595,7 +1806,7 @@ combine(int4* combined_x, float* combined_topk_weights,
             int cached_channel_tail_idx = 0;
             for (int64_t token_idx = token_start_idx + warp_id; token_idx < token_end_idx; token_idx += kNumRDMAReceivers) {
                 // Read expected head
-                EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA peers");
+                EP_STATIC_ASSERT(kNumRDMARanks <= kWarpSize, "Invalid number of RDMA peers");
                 int expected_head = -1;
                 if (lane_id < kNumRDMARanks) {
                     expected_head = ld_nc_global(combined_rdma_head + token_idx * kNumRDMARanks + lane_id);
@@ -1603,35 +1814,38 @@ combine(int4* combined_x, float* combined_topk_weights,
                 }
 
                 // Wait lanes to be ready
-                auto start_time = clock64();
+                auto start_time = wall_clock64();
                 while (cached_channel_tail_idx <= expected_head) {
-                    cached_channel_tail_idx = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
+                    cached_channel_tail_idx = static_cast<int>(ld_relaxed_sys_global(rdma_channel_tail.buffer(lane_id)));
 
                     // Timeout check
-                    if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
+                    long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                    if (elapsed_time > NUM_TIMEOUT_CYCLES) {
                         printf("DeepEP combine RDMA receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, tail: %d, waiting: %ld, expect: %d\n",
                                channel_id, rdma_rank, nvl_rank, lane_id, cached_channel_tail_idx, token_idx, expected_head);
                         trap();
                     }
+                      __builtin_amdgcn_s_sleep(1);
                 }
-                __syncwarp();
+                syncwarp();
 
                 // Combine current token
                 auto recv_fn = [&](int src_rdma_rank, int slot_idx, int hidden_int4_idx) -> int4 { return ld_nc_global(reinterpret_cast<const int4*>(rdma_channel_data.recv_buffer(src_rdma_rank) + slot_idx * num_bytes_per_rdma_token) + hidden_int4_idx);};
                 auto recv_tw_fn = [&](int src_rdma_rank, int slot_idx, int topk_idx) -> float { return ld_nc_global(reinterpret_cast<const float*>(rdma_channel_data.recv_buffer(src_rdma_rank) + slot_idx * num_bytes_per_rdma_token + hidden_bytes + sizeof(SourceMeta)) + topk_idx);};
-                combine_token<kNumRDMARanks, dtype_t, kNumTopkRDMARanks>(expected_head >= 0,
-                                                                         expected_head, lane_id,
-                                                                         hidden_int4, num_topk,
-                                                                         combined_x + token_idx * hidden_int4,
-                                                                         combined_topk_weights + token_idx * num_topk,
-                                                                         num_max_rdma_chunked_recv_tokens, recv_fn, recv_tw_fn);
+                combine_token<kNumRDMARanks, dtype_t, kNumTopkRDMARanks, kEmulatedWarpSize>(expected_head >= 0,
+                                                                                            expected_head, lane_id,
+                                                                                            hidden_int4, num_topk,
+                                                                                            combined_x + token_idx * hidden_int4,
+                                                                                            combined_topk_weights + token_idx * num_topk,
+                                                                                            num_max_rdma_chunked_recv_tokens, recv_fn, recv_tw_fn);
             }
 
             // Retired
-            __syncwarp();
+            syncwarp();
             if (lane_id == 0)
                 rdma_receiver_retired[warp_id] = true;
         } else {
+            lane_id = get_lane_id();
             // Coordinator
             // Sync shared memory status
             is_rdma_receiver_sm ? sync_rdma_receiver_smem() : sync_forwarder_smem();
@@ -1641,12 +1855,12 @@ combine(int4* combined_x, float* combined_topk_weights,
             int last_nvl_head[kNumRDMARanks] = {0};
             int dst_rdma_rank = lane_id < kNumRDMARanks ? lane_id : 0;
             int dst_nvl_rank = lane_id < NUM_MAX_NVL_PEERS ? lane_id : 0;
-            EP_STATIC_ASSERT(kNumCombineForwarderWarps <= 32, "Invalid number of forwarder warps");
+            EP_STATIC_ASSERT(kNumCombineForwarderWarps <= kWarpSize, "Invalid number of forwarder warps");
             while (true) {
                 // Retired
-                if (is_rdma_receiver_sm and __all_sync(0xffffffff, lane_id >= kNumRDMAReceivers or rdma_receiver_retired[lane_id]))
+                if (is_rdma_receiver_sm and __all_sync(kFullWarpMask, lane_id >= kNumRDMAReceivers or rdma_receiver_retired[lane_id]))
                     break;
-                if (not is_rdma_receiver_sm and __all_sync(0xffffffff, lane_id >= kNumForwarders or forwarder_retired[lane_id]))
+                if (not is_rdma_receiver_sm and __all_sync(kFullWarpMask, lane_id >= kNumForwarders or forwarder_retired[lane_id]))
                     break;
 
                 // Find minimum head for RDMA ranks
@@ -1656,8 +1870,14 @@ combine(int4* combined_x, float* combined_topk_weights,
                     for (int i = 0; i < kNumRDMAReceivers; ++ i) if (not rdma_receiver_retired[i])
                         min_head = min(min_head, rdma_receiver_rdma_head[i][dst_rdma_rank]);
                     if (min_head != std::numeric_limits<int>::max() and min_head >= last_rdma_head + num_max_rdma_chunked_send_tokens and lane_id < kNumRDMARanks) {
-                        nvshmemx_signal_op(rdma_channel_head.buffer(rdma_rank), min_head - last_rdma_head, NVSHMEM_SIGNAL_ADD,
+#if defined(ROCM_DISABLE_CTX)
+                        shmem_signal_op_add(
+#else
+                        rocshmem::rocshmem_ctx_ulong_atomic_add(ctx,
+#endif
+                            rdma_channel_head.buffer(rdma_rank), min_head - last_rdma_head,
                                            translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
+
                         last_rdma_head = min_head;
                     }
                 } else {
@@ -1674,10 +1894,17 @@ combine(int4* combined_x, float* combined_topk_weights,
                 }
 
                 // Nanosleep and let other warps work
+#ifndef USE_ROCM
                 __nanosleep(NUM_WAIT_NANOSECONDS);
+#else
+                __builtin_amdgcn_s_sleep(NUM_WAIT_CYCLES_TIMES_64);
+#endif
             }
         }
     }
+#if !defined(ROCM_DISABLE_CTX)
+    shmem_wg_ctx_destroy(&ctx);
+#endif
 }
 
 void combine(cudaDataType_t type,
@@ -1694,8 +1921,8 @@ void combine(cudaDataType_t type,
 
 #define COMBINE_LAUNCH_CASE(num_rdma_ranks) { \
     auto combine_func = low_latency_mode ? \
-        combine<true, num_rdma_ranks, nv_bfloat16, kNumCombineForwarderWarps> : combine<false, num_rdma_ranks, nv_bfloat16, kNumCombineForwarderWarps>; \
-    LAUNCH_KERNEL(&cfg, combine_func, \
+        combine<true, num_rdma_ranks, gpu_bfloat16_t, kNumCombineForwarderWarps> : combine<false, num_rdma_ranks, gpu_bfloat16_t, kNumCombineForwarderWarps>; \
+    LAUNCH_KERNEL_NON_COOPERATIVE(&cfg, combine_func, \
                   reinterpret_cast<int4*>(combined_x), combined_topk_weights, is_combined_token_in_rank, \
                   reinterpret_cast<const int4*>(x), topk_weights, \
                   combined_rdma_head, combined_nvl_head, \
@@ -1711,13 +1938,12 @@ void combine(cudaDataType_t type,
     EP_HOST_ASSERT(num_forwarder_warps > 0 and num_forwarder_warps % num_rdma_ranks == 0);
     EP_HOST_ASSERT(num_max_nvl_chunked_recv_tokens % num_rdma_ranks == 0);
     EP_HOST_ASSERT(num_max_nvl_chunked_recv_tokens / num_rdma_ranks > std::max(num_max_rdma_chunked_send_tokens, num_max_nvl_chunked_send_tokens));
-    EP_HOST_ASSERT(type == CUDA_R_16BF);
+    EP_HOST_ASSERT(type == GPU_R_16BF);
 
-    SETUP_LAUNCH_CONFIG(num_channels * 2, (NUM_MAX_NVL_PEERS + num_forwarder_warps + 1) * 32, stream);
+    SETUP_LAUNCH_CONFIG(num_channels * 2, (NUM_MAX_NVL_PEERS + num_forwarder_warps) * kEmulatedWarpSize + kWarpSize, stream);
     SWITCH_RDMA_RANKS(COMBINE_LAUNCH_CASE);
 #undef COMBINE_LAUNCH_CASE
 }
-
 } // namespace internode
 
 } // namespace deep_ep

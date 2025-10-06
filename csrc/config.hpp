@@ -1,7 +1,8 @@
 #pragma once
 
-#include "kernels/api.cuh"
 #include "kernels/exception.cuh"
+#include "kernels/api.cuh"
+#include "kernels/launch.cuh"
 
 namespace deep_ep {
 
@@ -96,13 +97,19 @@ struct LowLatencyBuffer {
 
     void* dispatch_rdma_send_buffer = nullptr;
     void* dispatch_rdma_recv_data_buffer = nullptr;
-    int* dispatch_rdma_recv_count_buffer = nullptr;
+    int64_t* dispatch_rdma_recv_count_buffer = nullptr;
 
     void* combine_rdma_send_buffer = nullptr;
     void* combine_rdma_recv_data_buffer = nullptr;
-    int* combine_rdma_recv_flag_buffer = nullptr;
+    int64_t* combine_rdma_recv_flag_buffer = nullptr;
 
-    std::pair<int*, int> clean_meta() {
+    void* combine_rdma_send_buffer_data_start = nullptr;
+    size_t num_bytes_per_combine_msg = 0;
+
+    size_t nvl_recv_data_buffer_offset = 0;
+    size_t nvl_recv_count_buffer_offset = 0;
+
+    std::pair<int64_t*, int> clean_meta() {
         EP_HOST_ASSERT(dispatch_rdma_recv_count_buffer == combine_rdma_recv_flag_buffer);
         return {dispatch_rdma_recv_count_buffer, num_clean_int};
     }
@@ -128,8 +135,8 @@ struct LowLatencyLayout {
 
         // Message sizes
         EP_HOST_ASSERT(num_scales * sizeof(float) <= hidden);
-        size_t num_bytes_per_dispatch_msg = sizeof(int4) + std::max(hidden * sizeof(nv_bfloat16), hidden + num_scales * sizeof(float));
-        size_t num_bytes_per_combine_msg = sizeof(int4) + hidden * sizeof(nv_bfloat16);
+        size_t num_bytes_per_dispatch_msg = sizeof(int4) + std::max(hidden * sizeof(gpu_bfloat16_t), hidden + num_scales * sizeof(float));
+        size_t num_bytes_per_combine_msg = sizeof(int4) + hidden * sizeof(gpu_bfloat16_t);
 
         // Send buffer
         size_t dispatch_send_buffer_bytes = num_max_dispatch_tokens_per_rank * num_bytes_per_dispatch_msg;
@@ -147,7 +154,7 @@ struct LowLatencyLayout {
         total_bytes += recv_buffer_bytes * 2;
 
         // Symmetric signaling buffers
-        size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int);
+        size_t dispatch_recv_count_buffer_bytes = num_experts * sizeof(int64_t);
         size_t combine_recv_flag_buffer_bytes = dispatch_recv_count_buffer_bytes;
         size_t signaling_buffer_bytes = std::max(dispatch_recv_count_buffer_bytes, combine_recv_flag_buffer_bytes);
         total_bytes += signaling_buffer_bytes * 2;
@@ -157,19 +164,23 @@ struct LowLatencyLayout {
         // so you may see some parameters are duplicated
         for (int i = 0; i < 2; ++ i) {
             buffers[i] = {
-                static_cast<int>(signaling_buffer_bytes / sizeof(int)),
+                static_cast<int>(signaling_buffer_bytes / sizeof(int64_t)),
                 advance(rdma_buffer, send_buffer_bytes * i),
                 advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i),
-                advance<int*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i),
+                advance<int64_t*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i),
                 advance(rdma_buffer, send_buffer_bytes * i),
                 advance(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * i),
-                advance<int*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i)
+                advance<int64_t*>(rdma_buffer, send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i),
+                advance(rdma_buffer, send_buffer_bytes * i + sizeof(int4)),
+                num_bytes_per_combine_msg,
+                send_buffer_bytes * 2 + recv_buffer_bytes * i,
+                send_buffer_bytes * 2 + recv_buffer_bytes * 2 + signaling_buffer_bytes * i
             };
         }
     }
 };
 
-size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
+inline size_t get_low_latency_rdma_size_hint(int num_max_dispatch_tokens_per_rank, int hidden, int num_ranks, int num_experts) {
     auto num_bytes = LowLatencyLayout(nullptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts).total_bytes;
     return ((num_bytes + NUM_BUFFER_ALIGNMENT_BYTES) / NUM_BUFFER_ALIGNMENT_BYTES) * NUM_BUFFER_ALIGNMENT_BYTES;
 }

@@ -24,7 +24,6 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     scores = torch.randn((num_tokens, num_experts), dtype=torch.float32, device='cuda').abs() + 1
     topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     topk_weights = torch.randn((num_tokens, num_topk), dtype=torch.float32, device='cuda').abs()
-
     # Randomly mask some positions
     for i in range(10):
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
@@ -32,6 +31,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
+
     for return_recv_hook in (False, True):
         for dispatch_use_fp8 in (False, True):
             num_times += 1
@@ -43,6 +43,9 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
             packed_recv_x = (packed_recv_x[0], packed_recv_x[1].contiguous()) if dispatch_use_fp8 else packed_recv_x
             simulated_gemm_x = per_token_cast_back(packed_recv_x[0].view(-1, hidden), packed_recv_x[1].view(-1, hidden // 128)).view(packed_recv_x[0].shape) \
                 if dispatch_use_fp8 else packed_recv_x.clone()
+            #print(f"rank{rank}: packed_recv_x[0]\n{packed_recv_x[0].cpu()}\n")
+            #print(f"rank{rank}: packed_recv_x[1]\n{packed_recv_x[1].cpu()}\n")
+            #print(f"simulated_gemm_x{simulated_gemm_x.cpu()}")
             all_topk_idx = torch.empty((num_ranks, num_tokens, num_topk), dtype=topk_idx.dtype, device='cuda')
             dist.all_gather_into_tensor(all_topk_idx, topk_idx, group=group)
             for i in range(num_local_experts if do_check else 0):
@@ -73,14 +76,19 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
             # Check combine correctness
-            combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
-                                                                 async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
-            hook() if return_recv_hook else event.current_stream_wait()
-            if do_check:
-                diff = calc_diff(x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
-                assert torch.isnan(combined_x).sum().item() == 0
-                assert diff < 1e-5, f'Error: diff={diff}'
-                hash_value ^= hash_tensor(combined_x)
+            for zero_copy in (False, True):
+                if zero_copy:
+                    buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
+                out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
+                                                                     async_finish=not return_recv_hook,
+                                                                     return_recv_hook=return_recv_hook, out=out)
+                hook() if return_recv_hook else event.current_stream_wait()
+                if do_check:
+                    diff = calc_diff(x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
+                    assert torch.isnan(combined_x).sum().item() == 0
+                    assert diff < 1e-5, f'Error: diff={diff}'
+                    hash_value ^= hash_tensor(combined_x)
 
     def create_test_cast_with_outliers(num_outliers):
         tmp = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -100,13 +108,15 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         hook()
 
     # noinspection PyShadowingNames
-    def test_func(return_recv_hook):
+    def test_func(zero_copy: bool, return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = \
             buffer.low_latency_dispatch(x, topk_idx, num_tokens, num_experts,
                                         async_finish=False, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
+        if zero_copy:
+            buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
         combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
-                                                             return_recv_hook=return_recv_hook)
+                                                             zero_copy=zero_copy, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
 
     # Calculate bandwidth
@@ -118,14 +128,15 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_combine_comm_bytes += num_bf16_bytes * num_selections
 
     # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(partial(test_func, return_recv_hook=False))
+    avg_t, min_t, max_t = bench(partial(test_func, zero_copy=False, return_recv_hook=False))
     print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
     # Separate profiling
     for return_recv_hook in (False, True):
         group.barrier()
-        dispatch_t, combine_t = bench_kineto(partial(test_func, return_recv_hook=return_recv_hook),
+
+        dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
                                              suppress_kineto_output=True)
         if not return_recv_hook:
@@ -141,6 +152,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+    # The default setting of deepEP upstream is below: 
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
     num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)

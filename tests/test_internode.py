@@ -9,6 +9,7 @@ from utils import init_dist, bench, calc_diff, create_grouped_scores, inplace_un
 
 # Test compatibility with low latency functions
 import test_low_latency
+import argparse
 
 
 def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup):
@@ -144,7 +145,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
                     if with_topk:
                         combine_args.update({'topk_weights': recv_topk_weights})
                     if previous_mode:
-                        dispatch_args.update({'previous_event': buffer.capture()})
+                        combine_args.update({'previous_event': buffer.capture()})
                     combined_x, combined_topk_weights, event = buffer.combine(**combine_args)
                     event.current_stream_wait() if async_mode else ()
                     check_x = combined_x.float() / is_token_in_rank.sum(dim=1).unsqueeze(1)
@@ -202,7 +203,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     # Tune combine performance
     best_time, best_results = 1e10, None
     for nvl_chunk_size in range(1, 5, 1):
-        for rdma_chunk_size in range(8, 33, 4):
+        # TODO: Sort out the assertation for 16 nodes
+        upper_bound = 29 if num_ranks == 128 else 33
+        for rdma_chunk_size in range(8, upper_bound, 4):
             config = deep_ep.Config(num_sms, nvl_chunk_size, nvl_buffer_size, rdma_chunk_size, rdma_buffer_size)
             tune_args = {'x': recv_x, 'handle': handle, 'config': config}
             t = bench(lambda: buffer.combine(**tune_args))[0]
@@ -217,9 +220,9 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
 
 # noinspection PyUnboundLocalVariable
-def test_loop(local_rank: int, num_local_ranks: int):
-    num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
+def test_loop(local_rank: int, num_local_ranks: int, backend: str):
+    num_nodes = int(os.getenv('WORLD_SIZE', 2))
+    rank, num_ranks, group = init_dist(local_rank, num_local_ranks, backend=backend)
     test_ll_compatibility = False
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
@@ -229,7 +232,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
 
-    for i in (24, ):
+    for i in (32, ):
         test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
         if local_rank == 0:
             print()
@@ -241,5 +244,15 @@ def test_loop(local_rank: int, num_local_ranks: int):
 
 
 if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Test internode communication')
+    parser.add_argument('--backend', type=str, choices=['mpi', 'nccl'], default='mpi',
+                        help='Backend for distributed communication (mpi or nccl)')
+    args = parser.parse_args()
     num_processes = 8
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, ), nprocs=num_processes)
+    if args.backend == 'mpi':
+        dist.init_process_group(backend='mpi')
+        rank = dist.get_rank()
+        local_rank = rank % num_processes
+        test_loop(local_rank=local_rank, num_local_ranks=num_processes, backend='mpi')
+    else:
+        torch.multiprocessing.spawn(test_loop, args=(num_processes, 'nccl'), nprocs=num_processes)

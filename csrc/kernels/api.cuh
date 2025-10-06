@@ -12,9 +12,11 @@ void barrier(int **task_fifo_ptrs, int head, int rank, int num_ranks, cudaStream
 } // namespace intranode
 
 // Internode runtime
+
 namespace internode {
 
 std::vector<uint8_t> get_unique_id();
+
 
 int init(const std::vector<uint8_t> &root_unique_id_val, int rank, int num_ranks, bool low_latency_mode);
 
@@ -69,6 +71,7 @@ namespace internode {
 
 int get_source_meta_bytes();
 
+
 void get_dispatch_layout(const int64_t* topk_idx,
                          int* num_tokens_per_rank, int* num_tokens_per_rdma_rank,
                          int* num_tokens_per_expert, bool* is_token_in_rank,
@@ -120,35 +123,39 @@ void combine(cudaDataType_t type,
              void* rdma_buffer_ptr, int num_max_rdma_chunked_send_tokens, int num_max_rdma_chunked_recv_tokens,
              void** buffer_ptrs, int num_max_nvl_chunked_send_tokens, int num_max_nvl_chunked_recv_tokens,
              int rank, int num_ranks, cudaStream_t stream, int num_channels, bool low_latency_mode);
-
 } // namespace internode
 
+#if !DISABLE_INTERNODE
 // Internode low-latency kernels
 namespace internode_ll {
 
-void clean_low_latency_buffer(int* clean_0, int num_clean_int_0,
-                              int* clean_1, int num_clean_int_1,
+void clean_low_latency_buffer(int64_t* clean_0, int num_clean_int_0,
+                              int64_t* clean_1, int num_clean_int_1,
                               cudaStream_t stream);
 
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
               int* packed_recv_count,
-              void* rdma_recv_x, int* rdma_recv_count, void* rdma_x,
+              int* global_atomic_counter,
+              void* rdma_recv_x, int64_t* rdma_recv_count, void* rdma_x,
               const void* x, const int64_t* topk_idx,
-              int* next_clean, int num_next_clean_int,
+              int64_t* next_clean, int num_next_clean_int,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
               void* workspace, cudaStream_t stream, int phases);
 
 void combine(void* combined_x,
-             void* rdma_recv_x, int* rdma_recv_flag, void* rdma_send_x,
+             void* rdma_recv_x, int64_t* rdma_recv_flag, void* rdma_send_x,
              const void* x, const int64_t* topk_idx, const float* topk_weights,
              const int* src_info, const int64_t* layout_range,
-             int* next_clean, int num_next_clean_int,
+             int* global_atomic_counter,
+             int64_t* next_clean, int num_next_clean_int,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
-             void* workspace, cudaStream_t stream, int phases);
+             void* workspace, cudaStream_t stream,
+             int phases, bool zero_copy);
 
 } // namespace internode_ll
+#endif
 
 } // namespace deep_ep

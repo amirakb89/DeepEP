@@ -1,131 +1,65 @@
-# Install NVSHMEM
+# Install rocSHMEM
+## Hardware Prerequisites
+- AMD MI308X/MI300X GPU
+- Infiniband ConnectX-7 (IB or RoCE both acceptable, ideally would test both variants)
+   - For more detailed requirements, see [rocSHMEM](https://github.com/ROCm/rocSHMEM) github repository
 
-## Important notices
 
-**This project is neither sponsored nor supported by NVIDIA.**
-
-**Use of NVIDIA NVSHMEM is governed by the terms at [NVSHMEM Software License Agreement](https://docs.nvidia.com/nvshmem/api/sla.html).**
-
-## Prerequisites
-
-1. [GDRCopy](https://github.com/NVIDIA/gdrcopy) (v2.4 and above recommended) is a low-latency GPU memory copy library based on NVIDIA GPUDirect RDMA technology, and *it requires kernel module installation with root privileges.*
-
-2. Hardware requirements
-   - GPUDirect RDMA capable devices, see [GPUDirect RDMA Documentation](https://docs.nvidia.com/cuda/gpudirect-rdma/)
-   - InfiniBand GPUDirect Async (IBGDA) support, see [IBGDA Overview](https://developer.nvidia.com/blog/improving-network-performance-of-hpc-systems-using-nvidia-magnum-io-nvshmem-and-gpudirect-async/)
-   - For more detailed requirements, see [NVSHMEM Hardware Specifications](https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/abstract.html#hardware-requirements)
-
-## Installation procedure
-
-### 1. Install GDRCopy
-
-GDRCopy requires kernel module installation on the host system. Complete these steps on the bare-metal host before container deployment:
-
-#### Build and installation
+## Build and installation
 
 ```bash
-wget https://github.com/NVIDIA/gdrcopy/archive/refs/tags/v2.4.4.tar.gz
-cd gdrcopy-2.4.4/
-make -j$(nproc)
-sudo make prefix=/opt/gdrcopy install
+# Obtain develop branch
+git clone git@github.com:ROCm/rocSHMEM.git
+
+# Build dependencies Open MPI/UCX (used for RO, and as a bootstrap mechanism otherwise)
+export BUILD_DIR=$PWD
+../rocSHMEM/scripts/install_dependencies.sh
+export PATH=$PWD/ompi/bin:$PATH
+export LD_LIBRARY_PATH=$PWD/ucx/lib:$PWD/ompi/lib:$LD_LIBRARY_PATH
+
+# Build rocSHMEM library, library will be installed in $HOME/rocshmem
+mkdir build.mnic && cd build.mnic
+MPI_ROOT=$BUILD_DIR/ompi ../rocSHMEM/scripts/build_configs/gda_mlx5 --fresh \
+  -DUSE_IPC=ON \
+  -DGDA_BNXT=ON
+
+# You may pass additional arguments to Cmake,
+#   e.g., -DBUILD_LOCAL_GPU_TARGET_ONLY=ON
 ```
+# pytorch patch 
 
-#### Kernel module installation
-
-After compiling the software, you need to install the appropriate packages based on your Linux distribution.
-For instance, using Ubuntu 22.04 and CUDA 12.3 as an example:
-
+Follow the below instruction for pytorch commits older than [e4adf5d](https://github.com/pytorch/pytorch/commit/e4adf5df39d9c472c7dcbac18efde29241e238f0).
 ```bash
-pushd packages
-CUDA=/path/to/cuda ./build-deb-packages.sh
-sudo dpkg -i gdrdrv-dkms_2.4.4_amd64.Ubuntu22_04.deb \
-             libgdrapi_2.4.4_amd64.Ubuntu22_04.deb \
-             gdrcopy-tests_2.4.4_amd64.Ubuntu22_04+cuda12.3.deb \
-             gdrcopy_2.4.4_amd64.Ubuntu22_04.deb
-popd
-sudo ./insmod.sh  # Load kernel modules on the bare-metal system
+TARGET="/opt/conda/envs/py_3.12/lib/python3.12/site-packages/torch/utils/cpp_extension.py"
+# 1) Create the patch (use a here-doc—safer than many echo’s)
+cat > /tmp/torch.patch <<'PATCH'
+--- /opt/conda/envs/py_3.12/lib/python3.12/site-packages/torch/utils/cpp_extension.py
++++ /opt/conda/envs/py_3.12/lib/python3.12/site-packages/torch/utils/cpp_extension.py
+@@ -2114,7 +2114,7 @@
+     if cflags is not None:
+         for flag in cflags:
+             if 'amdgpu-target' in flag or 'offload-arch' in flag:
+-                return ['-fno-gpu-rdc']
++                return ['-fgpu-rdc']
+     # Use same defaults as used for building PyTorch
+     # Allow env var to override, just like during initial cmake build.
+     _archs = os.environ.get('PYTORCH_ROCM_ARCH', None)
+@@ -2127,7 +2127,7 @@
+     else:
+         archs = _archs.replace(' ', ';').split(';')
+     flags = [f'--offload-arch={arch}' for arch in archs]
+-    flags += ['-fno-gpu-rdc']
++    flags += ['-fgpu-rdc']
+     return flags
+ def _get_build_directory(name: str, verbose: bool) -> str:
+PATCH
+# 2) (Optional) sanity check the file exists
+[[ -f "$TARGET" ]] || { echo "Missing: $TARGET"; exit 1; }
+# 3) Dry run first (shows what would change; no write)
+patch --dry-run "$TARGET" < /tmp/torch.patch
+# 4) Apply with a backup of the original file (*.orig)
+patch --backup -z .orig "$TARGET" < /tmp/torch.patch
+# 5) Verify the changes
+grep -n "fgpu-rdc" "$TARGET"
 ```
 
-#### Container environment notes
-
-For containerized environments:
-1. Host: keep kernel modules loaded (`gdrdrv`)
-2. Container: install DEB packages *without* rebuilding modules:
-   ```bash
-   sudo dpkg -i gdrcopy_2.4.4_amd64.Ubuntu22_04.deb \
-                libgdrapi_2.4.4_amd64.Ubuntu22_04.deb \
-                gdrcopy-tests_2.4.4_amd64.Ubuntu22_04+cuda12.3.deb
-   ```
-
-#### Verification
-
-```bash
-gdrcopy_copybw  # Should show bandwidth test results
-```
-
-### 2. Acquiring NVSHMEM source code
-
-Download NVSHMEM v3.2.5 from the [NVIDIA NVSHMEM OPEN SOURCE PACKAGES](https://developer.nvidia.com/downloads/assets/secure/nvshmem/nvshmem_src_3.2.5-1.txz).
-
-### 3. Apply our custom patch
-
-Navigate to your NVSHMEM source directory and apply our provided patch:
-
-```bash
-git apply /path/to/deep_ep/dir/third-party/nvshmem.patch
-```
-
-### 4. Configure NVIDIA driver
-
-Enable IBGDA by modifying `/etc/modprobe.d/nvidia.conf`:
-
-```bash
-options nvidia NVreg_EnableStreamMemOPs=1 NVreg_RegistryDwords="PeerMappingOverride=1;"
-```
-
-Update kernel configuration:
-
-```bash
-sudo update-initramfs -u
-sudo reboot
-```
-
-For more detailed configurations, please refer to the [NVSHMEM Installation Guide](https://docs.nvidia.com/nvshmem/release-notes-install-guide/install-guide/abstract.html).
-
-### 5. Build and installation
-
-The following example demonstrates building NVSHMEM with IBGDA support:
-
-```bash
-CUDA_HOME=/path/to/cuda \
-GDRCOPY_HOME=/path/to/gdrcopy \
-NVSHMEM_SHMEM_SUPPORT=0 \
-NVSHMEM_UCX_SUPPORT=0 \
-NVSHMEM_USE_NCCL=0 \
-NVSHMEM_MPI_SUPPORT=0 \
-NVSHMEM_IBGDA_SUPPORT=1 \
-NVSHMEM_PMIX_SUPPORT=0 \
-NVSHMEM_TIMEOUT_DEVICE_POLLING=0 \
-NVSHMEM_USE_GDRCOPY=1 \
-cmake -S . -B build/ -DCMAKE_INSTALL_PREFIX=/path/to/your/dir/to/install
-
-cd build
-make -j$(nproc)
-make install
-```
-
-## Post-installation configuration
-
-Set environment variables in your shell configuration:
-
-```bash
-export NVSHMEM_DIR=/path/to/your/dir/to/install  # Use for DeepEP installation
-export LD_LIBRARY_PATH="${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH"
-export PATH="${NVSHMEM_DIR}/bin:$PATH"
-```
-
-## Verification
-
-```bash
-nvshmem-info -a # Should display details of nvshmem
-```

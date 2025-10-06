@@ -35,6 +35,8 @@ private:
     void* buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
     void** buffer_ptrs_gpu = nullptr;
 
+    void* nvl_buffer_ptrs[NUM_MAX_NVL_PEERS] = {nullptr};
+    void** nvl_buffer_ptrs_gpu = nullptr;
     // NVSHMEM Buffer
     int64_t num_rdma_bytes;
     void* rdma_buffer_ptr = nullptr;
@@ -44,6 +46,7 @@ private:
     int rank, rdma_rank, nvl_rank;
     int num_ranks, num_rdma_ranks, num_nvl_ranks;
     cudaIpcMemHandle_t ipc_handles[NUM_MAX_NVL_PEERS];
+    cudaIpcMemHandle_t pxn_ipc_handles[NUM_MAX_NVL_PEERS];
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
@@ -94,11 +97,15 @@ public:
     pybind11::bytearray get_local_ipc_handle() const;
 
     pybind11::bytearray get_local_nvshmem_unique_id() const;
+    
+    pybind11::bytearray get_local_pxn_ipc_handle() const;
 
     torch::Tensor get_local_buffer_tensor(const pybind11::object& dtype, int64_t offset, bool use_rdma_buffer) const;
 
     void sync(const std::vector<int>& device_ids, const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles, const std::optional<pybind11::bytearray>& root_unique_id_opt);
 
+    void sync_pxn_handles(const std::vector<int>& device_ids, const std::vector<std::optional<pybind11::bytearray>>& all_gathered_handles);
+    
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor, torch::Tensor, std::optional<EventHandle>>
     get_dispatch_layout(const torch::Tensor& topk_idx, int num_experts, std::optional<EventHandle>& previous_event,
                         bool async, bool allocate_on_comm_stream);
@@ -143,7 +150,16 @@ public:
     low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_idx, const torch::Tensor& topk_weights,
                         const torch::Tensor& src_info, const torch::Tensor& layout_range,
                         int num_max_dispatch_tokens_per_rank, int num_experts,
-                        bool async, bool return_recv_hook);
+                        bool zero_copy, bool async, bool return_recv_hook,
+                        const std::optional<torch::Tensor>& out = std::nullopt);
+
+    torch::Tensor
+    get_next_low_latency_combine_buffer(int num_max_dispatch_tokens_per_rank, int hidden, int num_experts);
+
+    // addtional interface for c++
+    std::string get_local_ipc_handle_string() const;
+    std::string get_local_nvshmem_unique_id_string() const;
+    void sync_string(const std::vector<int>& device_ids, const std::vector<std::string>& all_gathered_handles, const std::string& root_unique_id_opt);
 };
 
 } // namespace deep_ep
