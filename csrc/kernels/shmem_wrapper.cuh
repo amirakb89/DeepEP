@@ -76,6 +76,8 @@ static inline const auto &shmem_ctx_schar_put_nbi_warp =
     rocshmem::rocshmem_ctx_schar_put_nbi_wave;
 static inline const auto &shmem_ctx_int_put_nbi_warp =
     rocshmem::rocshmem_ctx_int_put_nbi_wave;
+static inline const auto &shmem_ctx_schar_put_nbi =
+    rocshmem::rocshmem_ctx_schar_put_nbi;
 #endif
 #else
 // NVSHMEM wrapper
