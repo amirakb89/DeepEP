@@ -778,11 +778,6 @@ asm volatile(
                         num_bytes_per_rdma_token * num_tokens_to_issue,
                         translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank,
                                                                  nvl_rank));
-#if defined(ROCM_DISABLE_CTX)
-                    shmem_fence();
-#else
-                    shmem_ctx_quiet(ctx);
-#endif
                 } else {
                     // Lighter fence for local RDMA rank
                     memory_fence();
@@ -815,7 +810,9 @@ asm volatile(
         // Wait counters to arrive
         int num_tokens_to_recv_from_rdma = 0, src_rdma_channel_prefix = 0;
         EP_DEVICE_ASSERT(kNumRDMARanks <= kWarpSize);
+#ifdef ENABLE_TIMER
         auto start_time = wall_clock64();
+#endif
         if (lane_id < kNumRDMARanks) {
             while (true) {
                 auto meta_0 = ld_volatile_global(rdma_channel_meta.recv_buffer(lane_id) + dst_nvl_rank);
@@ -839,7 +836,7 @@ asm volatile(
                     EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
                     break;
                 }
-
+#ifdef ENABLE_TIMER
                 // Timeout check
                 long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
                 if (elapsed_time > NUM_TIMEOUT_CYCLES) {
@@ -847,6 +844,7 @@ asm volatile(
                            channel_id, rdma_rank, nvl_rank, lane_id, dst_nvl_rank, meta_0, meta_1, meta_2, meta_3);
                     trap();
                 }
+#endif
             }
         }
         syncwarp();
@@ -863,20 +861,23 @@ asm volatile(
         int cached_nvl_channel_head = 0, cached_nvl_channel_tail = 0, rdma_nvl_token_idx = 0;
         while (__any_sync(kFullWarpMask, num_tokens_to_recv_from_rdma > 0)) {
             // Check destination queue emptiness, or wait a buffer to be released
+#ifdef ENABLE_TIMER
             start_time = wall_clock64();
+#endif
             while (lane_id == 0) {
                 int num_used_slots = cached_nvl_channel_tail - cached_nvl_channel_head;
                 if (num_max_nvl_chunked_recv_tokens - num_used_slots >= num_max_nvl_chunked_send_tokens)
                     break;
                 cached_nvl_channel_head = ld_volatile_global(nvl_channel_head.buffer());
-
-                // // Timeout check
-                // long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
-                // if (elapsed_time > NUM_TIMEOUT_CYCLES) {
-                //     printf("DeepEP dispatch forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, head: %d, tail: %d\n",
-                //            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, ld_volatile_global(nvl_channel_head.buffer()), cached_nvl_channel_tail);
-                //     trap();
-                // }
+#ifdef ENABLE_TIMER
+                // Timeout check
+                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                if (elapsed_time > NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP dispatch forwarder timeout (NVL check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, head: %d, tail: %d\n",
+                           channel_id, rdma_rank, nvl_rank, dst_nvl_rank, ld_volatile_global(nvl_channel_head.buffer()), cached_nvl_channel_tail);
+                    trap();
+                }
+#endif
             }
             syncwarp();
 
@@ -890,14 +891,15 @@ asm volatile(
                     if (shfl_sync(cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
                 }
-
+#ifdef ENABLE_TIMER
                 // Timeout check
-                // long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
-                // if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
-                //     printf("DeepEP dispatch forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, src RDMA lane: %d, head: %d, tail: %d, expected: %d\n",
-                //            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id, cached_rdma_channel_head, cached_rdma_channel_tail, num_tokens_to_recv_from_rdma);
-                //     trap();
-                // }
+                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
+                    printf("DeepEP dispatch forwarder timeout (RDMA check), channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, src RDMA lane: %d, head: %d, tail: %d, expected: %d\n",
+                           channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id, cached_rdma_channel_head, cached_rdma_channel_tail, num_tokens_to_recv_from_rdma);
+                    trap();
+                }
+#endif
             }
             auto src_rdma_head = shfl_sync(cached_rdma_channel_head, src_rdma_rank);
             auto src_rdma_tail = shfl_sync(cached_rdma_channel_tail, src_rdma_rank);
@@ -1032,7 +1034,9 @@ asm volatile(
 
         // Receive channel offsets
         int start_offset = 0, end_offset = 0, num_tokens_to_recv;
+#ifdef ENABLE_TIMER
         auto start_time = wall_clock64();
+#endif
         while (lane_id < kNumRDMARanks) {
             start_offset = ld_volatile_global(nvl_channel_prefix_start.buffer() + lane_id);
             end_offset = ld_volatile_global(nvl_channel_prefix_end.buffer() + lane_id);
@@ -1041,14 +1045,15 @@ asm volatile(
                 total_offset += start_offset;
                 break;
             }
-
+#ifdef ENABLE_TIMER
             // Timeout check
-            // long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
-            // if (elapsed_time > NUM_TIMEOUT_CYCLES) {
-            //     printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d, start: %d, end: %d\n",
-            //            channel_id, rdma_rank, nvl_rank, lane_id, src_nvl_rank, start_offset, end_offset);
-            //     trap();
-            // }
+            long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+            if (elapsed_time > NUM_TIMEOUT_CYCLES) {
+                printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, src nvl: %d, start: %d, end: %d\n",
+                       channel_id, rdma_rank, nvl_rank, lane_id, src_nvl_rank, start_offset, end_offset);
+                trap();
+            }
+#endif
         }
         num_tokens_to_recv = warp_reduce_sum(end_offset - start_offset);
 
@@ -1060,7 +1065,9 @@ asm volatile(
         int cached_channel_head_idx = 0, cached_channel_tail_idx = 0;
         while (num_tokens_to_recv > 0) {
             // Check channel status by lane 0
+#ifdef ENABLE_TIMER
             start_time = wall_clock64();
+#endif
             while (lane_id == 0) {
                 // Ready to copy
                 if (cached_channel_head_idx != cached_channel_tail_idx)
@@ -1068,14 +1075,15 @@ asm volatile(
                 cached_channel_tail_idx = ld_relaxed_sys_global(nvl_channel_tail.buffer());
 
                 // Timeout check
-                // long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
-                // if (elapsed_time > NUM_TIMEOUT_CYCLES) {
-                //     printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d\n",
-                //            channel_id, rdma_rank, nvl_rank, src_nvl_rank, cached_channel_head_idx, cached_channel_tail_idx);
-                //     trap();
-                // }
+#ifdef ENABLE_TIMER
+                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                if (elapsed_time > NUM_TIMEOUT_CYCLES) {
+                    printf("DeepEP dispatch NVL receiver timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, head: %d, tail: %d\n",
+                           channel_id, rdma_rank, nvl_rank, src_nvl_rank, cached_channel_head_idx, cached_channel_tail_idx);
+                    trap();
+                }
+#endif
             }
-
             // Sync queue tail
             cached_channel_tail_idx = shfl_sync(cached_channel_tail_idx, 0);
 
@@ -1493,7 +1501,9 @@ combine(int4* combined_x, float* combined_topk_weights,
 
             // Decide next RDMA buffer to send
             bool is_lane_ready = false;
+#ifdef ENABLE_TIMER
             auto start_time = wall_clock64();
+#endif
             while (true) {
                 int num_used_slots = cached_channel_tail_idx - cached_channel_head_idx;
                 is_lane_ready = lane_id < kNumRDMARanks and token_start_idx < token_end_idx and num_max_nvl_chunked_recv_tokens_per_rdma - num_used_slots >= num_max_nvl_chunked_send_tokens;
@@ -1509,15 +1519,16 @@ combine(int4* combined_x, float* combined_topk_weights,
                 // Retry
                 if (lane_id < kNumRDMARanks and token_start_idx < token_end_idx)
                     cached_channel_head_idx = ld_volatile_global(nvl_channel_head.buffer() + lane_id);
-
+#ifdef ENABLE_TIMER
                 // Timeout check
-                // long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
-                // if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
-                //     printf("DeepEP combine NVL sender timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, RDMA lane: %d, head: %d, tail: %d, start: %d, end: %d\n",
-                //            channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id, ld_volatile_global(nvl_channel_head.buffer() + lane_id), cached_channel_tail_idx,
-                //            token_start_idx, token_end_idx);
-                //     trap();
-                // }
+                long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < kNumRDMARanks) {
+                    printf("DeepEP combine NVL sender timeout, channel: %d, RDMA: %d, nvl: %d, dst NVL: %d, RDMA lane: %d, head: %d, tail: %d, start: %d, end: %d\n",
+                           channel_id, rdma_rank, nvl_rank, dst_nvl_rank, lane_id, ld_volatile_global(nvl_channel_head.buffer() + lane_id), cached_channel_tail_idx,
+                           token_start_idx, token_end_idx);
+                    trap();
+                }
+#endif
                 __builtin_amdgcn_s_sleep(1);
             }
 
@@ -1644,10 +1655,12 @@ combine(int4* combined_x, float* combined_topk_weights,
                         //The while(...) loop polls the counter until all warps have arrived
                         if (lane_id == 0){
                             while (sync_large_warp_counters[lds_dst_rdma_rank] < (kNumWarpsPerForwarder)){
+#ifdef ENABLE_TIMER
                                 if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
                                     printf("DeepEP combine sync timeout. current num_sync_large_iteration %d. double it.\n", num_sync_large_iteration );
                                     trap();
                                 }
+#endif
                             }
                         }
                         syncwarp();
@@ -1688,7 +1701,9 @@ combine(int4* combined_x, float* combined_topk_weights,
                 // Check destination queue emptiness, or wait a buffer to be released
                 auto token_end_idx = min(token_start_idx + num_max_rdma_chunked_send_tokens, num_tokens_to_combine);
                 auto num_chunked_tokens = token_end_idx - token_start_idx;
+#ifdef ENABLE_TIMER
                 auto start_time = wall_clock64();
+#endif
                 while (sub_warp_id == 0 and lane_id == 0) {
                     // Inequality: `num_max_rdma_chunked_recv_tokens - (tail - head) >= num_chunked_tokens`
                     // Here, `token_start_idx` is the actual tail
@@ -1696,13 +1711,15 @@ combine(int4* combined_x, float* combined_topk_weights,
                     if (num_max_rdma_chunked_recv_tokens - num_used_slots >= num_chunked_tokens)
                         break;
 
+#ifdef ENABLE_TIMER
                     // Timeout check
-                    // long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
-                    // if (elapsed_time > NUM_TIMEOUT_CYCLES) {
-                    //     printf("DeepEP combine forwarder (RDMA check) timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, head: %ld, tail: %d, chunked: %d\n",
-                    //            channel_id, rdma_rank, nvl_rank, dst_rdma_rank, ld_volatile_global(rdma_channel_head.buffer(dst_rdma_rank)), token_start_idx, num_chunked_tokens);
-                    //     trap();
-                    // }
+                    long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                    if (elapsed_time > NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP combine forwarder (RDMA check) timeout, channel: %d, RDMA: %d, nvl: %d, dst RDMA: %d, head: %ld, tail: %d, chunked: %d\n",
+                               channel_id, rdma_rank, nvl_rank, dst_rdma_rank, ld_volatile_global(rdma_channel_head.buffer(dst_rdma_rank)), token_start_idx, num_chunked_tokens);
+                        trap();
+                    }
+#endif
                 }
 #ifdef USE_ROCM
                 sync_large_warp(token_start_idx, 0);
@@ -1718,17 +1735,20 @@ combine(int4* combined_x, float* combined_topk_weights,
                         expected_head = ld_nc_global(combined_nvl_head + token_idx * NUM_MAX_NVL_PEERS + lane_id);
 
                     // Wait lanes to be ready
+#ifdef ENABLE_TIMER
                     start_time = wall_clock64();
+#endif
                     while (cached_nvl_channel_tail_idx <= expected_head) {
                         cached_nvl_channel_tail_idx = ld_relaxed_sys_global(nvl_channel_tail.buffer(lane_id));
-
+#ifdef ENABLE_TIMER
                         // Timeout check
-                        // long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
-                        // if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < NUM_MAX_NVL_PEERS) {
-                        //     printf("DeepEP combine forwarder (NVL check) timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, dst RDMA: %d, tail: %d, waiting: %d, total: %d, sub: %d, large: %d, expected: %d\n",
-                        //            channel_id, rdma_rank, nvl_rank, lane_id, dst_rdma_rank, cached_nvl_channel_tail_idx, token_idx, num_tokens_to_combine, sub_warp_id, kNumWarpsPerForwarder, expected_head);
-                        //     trap();
-                        // }
+                        long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                        if (elapsed_time > NUM_TIMEOUT_CYCLES and lane_id < NUM_MAX_NVL_PEERS) {
+                            printf("DeepEP combine forwarder (NVL check) timeout, channel: %d, RDMA: %d, nvl: %d, src NVL: %d, dst RDMA: %d, tail: %d, waiting: %d, total: %d, sub: %d, large: %d, expected: %d\n",
+                                   channel_id, rdma_rank, nvl_rank, lane_id, dst_rdma_rank, cached_nvl_channel_tail_idx, token_idx, num_tokens_to_combine, sub_warp_id, kNumWarpsPerForwarder, expected_head);
+                            trap();
+                        }
+#endif
                         __builtin_amdgcn_s_sleep(1);
                     }
 
@@ -1837,20 +1857,23 @@ combine(int4* combined_x, float* combined_topk_weights,
                     expected_head = ld_nc_global(combined_rdma_head + token_idx * kNumRDMARanks + lane_id);
                     (expected_head < 0) ? (rdma_receiver_rdma_head[warp_id][lane_id] = -expected_head - 1) : (rdma_receiver_rdma_head[warp_id][lane_id] = expected_head);
                 }
-
+#ifdef ENABLE_TIMER
                 // Wait lanes to be ready
                 auto start_time = wall_clock64();
+#endif
                 while (cached_channel_tail_idx <= expected_head) {
                     cached_channel_tail_idx = static_cast<int>(ld_relaxed_sys_global(rdma_channel_tail.buffer(lane_id)));
 
                     // Timeout check
-                    // long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
-                    // if (elapsed_time > NUM_TIMEOUT_CYCLES) {
-                    //     printf("DeepEP combine RDMA receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, tail: %d, waiting: %ld, expect: %d\n",
-                    //            channel_id, rdma_rank, nvl_rank, lane_id, cached_channel_tail_idx, token_idx, expected_head);
-                    //     trap();
-                    // }
-                      __builtin_amdgcn_s_sleep(1);
+#ifdef ENABLE_TIMER
+                    long long int elapsed_time = wall_clock64() > start_time ? wall_clock64() - start_time : 0;
+                    if (elapsed_time > NUM_TIMEOUT_CYCLES) {
+                        printf("DeepEP combine RDMA receiver timeout, channel: %d, RDMA: %d, nvl: %d, src RDMA: %d, tail: %d, waiting: %ld, expect: %d\n",
+                               channel_id, rdma_rank, nvl_rank, lane_id, cached_channel_tail_idx, token_idx, expected_head);
+                        trap();
+                    }
+#endif
+                    __builtin_amdgcn_s_sleep(1);
                 }
                 syncwarp();
 

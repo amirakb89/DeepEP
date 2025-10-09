@@ -91,7 +91,8 @@ if __name__ == "__main__":
     define_macros = (
         ["-DUSE_ROCM=1", "-fgpu-rdc",] if variant == "rocm" else []
     )
-
+    if debug:
+        define_macros.append("-DENABLE_TIMER")
     if variant == "cuda" or rocm_disable_ctx:
         define_macros.append("-DROCM_DISABLE_CTX=1")
 
