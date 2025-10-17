@@ -12,7 +12,6 @@ namespace internode {
 
 extern shmem_team_t cpu_rdma_team;
 
-
 template<int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
 __global__ void __launch_bounds__(kNumThreads, 1)
 get_dispatch_layout(const int64_t* topk_idx,
