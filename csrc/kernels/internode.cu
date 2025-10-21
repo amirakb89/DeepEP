@@ -1787,7 +1787,7 @@ combine(int4* combined_x, float* combined_topk_weights,
                         auto rdma_slot_idx = token_start_idx % num_max_rdma_chunked_recv_tokens;
 #if defined(ROCM_DISABLE_CTX)
                         if constexpr (kUseWave){
-                            shmemx_int8_put_nbi_wave(rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
+                            shmemx_int8_put_nbi_warp(rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
                                                  rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
                                                  num_chunked_tokens * num_bytes_per_rdma_token,
                                                  translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
@@ -1800,14 +1800,14 @@ combine(int4* combined_x, float* combined_topk_weights,
                         }
 #else
                         if constexpr (kUseWave){
-                             shmem_ctx_schar_put_nbi_warp(ctx,
+                            shmem_ctx_schar_put_nbi_warp(ctx,
                                                  rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
                                                  rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
                                                  num_chunked_tokens * num_bytes_per_rdma_token,
                                                  translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
                         } else {
                             if (lane_id == 0)
-                                 shmem_ctx_schar_put_nbi(ctx,
+                                shmem_ctx_schar_put_nbi(ctx,
                                                  rdma_channel_data.recv_buffer(rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
                                                  rdma_channel_data.send_buffer(dst_rdma_rank) + rdma_slot_idx * num_bytes_per_rdma_token,
                                                  num_chunked_tokens * num_bytes_per_rdma_token,
