@@ -19,6 +19,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--debug", action="store_true", help="Debug mode")
     parser.add_argument("--verbose", action="store_true", help="Verbose build")
+    parser.add_argument("--enable_timer", action="store_true", help="Enable timer to debug time out in internode")
     parser.add_argument("--rocm-disable-ctx", action="store_true", help="Disable workgroup context optimization in internode")
 
     # Get the arguments to be parsed and separate setuptools arguments
@@ -26,6 +27,7 @@ if __name__ == "__main__":
     variant = args.variant
     debug = args.debug
     rocm_disable_ctx = args.rocm_disable_ctx
+    enable_timer = args.enable_timer
 
     # Reset sys.argv for setuptools to avoid conflicts
     sys.argv = [sys.argv[0]] + unknown_args
@@ -91,7 +93,8 @@ if __name__ == "__main__":
     define_macros = (
         ["-DUSE_ROCM=1", "-fgpu-rdc",] if variant == "rocm" else []
     )
-
+    if enable_timer:
+        define_macros.append("-DENABLE_TIMER")
     if variant == "cuda" or rocm_disable_ctx:
         define_macros.append("-DROCM_DISABLE_CTX=1")
 
