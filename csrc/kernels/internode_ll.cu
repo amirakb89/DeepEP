@@ -198,7 +198,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     for (int j = 0; j < kNumElemsPerRead; j += 2) {
                         float2 fp32x2 = {fp32_values[j] * scale, fp32_values[j + 1] * scale};
 #ifdef USE_ROCM
+#if defined(__gfx942__)
                         fp8x2_values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3_FNUZ);
+#endif
+#if defined(__gfx950__)
+                        fp8x2_values[j / 2] = __hip_cvt_float2_to_fp8x2(fp32x2, __HIP_SATFINITE, __HIP_E4M3);
+#endif
 #else
                         fp8x2_values[j / 2] = __nv_cvt_float2_to_fp8x2(fp32x2, __NV_SATFINITE, __NV_E4M3);
 #endif
@@ -234,11 +239,6 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     internode::shmem_ctx_schar_put_nbi_warp(ctx,
 #endif
                     reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(src_ptr), num_bytes_per_msg, dst_rank);
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmem_fence();
-#else
-                    internode::shmem_ctx_quiet(ctx);
-#endif
 #else
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
 #endif
@@ -296,6 +296,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
     }
 
+    if (thread_id == 0 and num_ranks > 8){
+#if defined(ROCM_DISABLE_CTX)
+                    internode::shmem_fence();
+#else
+                    internode::shmem_ctx_quiet(ctx);
+#endif
+    }
     //revert sync_large_warp_counters to 0 for next sync
     __syncthreads();
 
@@ -573,13 +580,14 @@ combine(void* combined_x,
                     internode::shmem_ctx_schar_put_nbi_warp(ctx,
 #endif
                     reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
-
+                if (num_ranks > 8){
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmem_fence();
 #else
                     internode::shmem_ctx_quiet(ctx);
 #endif
                 }
+            }
         }
 
         // Put finishing flag
