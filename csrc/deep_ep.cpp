@@ -1107,7 +1107,11 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
                             workspace, launch_stream, phases);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
-
+    hipEvent_t done;
+    CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(done, launch_stream.stream()));
+    CUDA_CHECK(cudaEventSynchronize(done));
+    CUDA_CHECK(cudaEventDestroy(done));
     // Wait streams
     std::optional<EventHandle> event;
     if (async) {
@@ -1207,7 +1211,11 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                               phases, zero_copy);
     };
     launcher(return_recv_hook ? LOW_LATENCY_SEND_PHASE : (LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE));
-
+    hipEvent_t done;
+    CUDA_CHECK(cudaEventCreateWithFlags(&done, cudaEventDisableTiming));
+    CUDA_CHECK(cudaEventRecord(done, launch_stream.stream()));
+    CUDA_CHECK(cudaEventSynchronize(done));
+    CUDA_CHECK(cudaEventDestroy(done));
     // Wait streams
     std::optional<EventHandle> event;
     if (async) {
