@@ -110,8 +110,8 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # noinspection PyShadowingNames
     def test_func(zero_copy: bool, return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = \
-            buffer.low_latency_dispatch(x, topk_idx, num_tokens, num_experts, use_fp8=dispatch_use_fp8,
-                                                async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
+            buffer.low_latency_dispatch(x, topk_idx, num_tokens, num_experts, use_fp8=True,
+                                                async_finish=False, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
         if zero_copy:
             buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
@@ -136,7 +136,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     for return_recv_hook in (False, True):
         group.barrier()
 
-        dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
+        dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=False, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
                                              suppress_kineto_output=True)
         if not return_recv_hook:

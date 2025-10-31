@@ -325,7 +325,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
            nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
 #endif
         } else {
-            st_na_release(reinterpret_cast<int *>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank), -num_tokens_sent - 1);
+            st_na_release(reinterpret_cast<int64_t *>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank), -num_tokens_sent - 1);
         }
 
         // Clean workspace for next use
@@ -616,7 +616,7 @@ combine(void* combined_x,
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_flag + global_expert_idx, 1, dst_rank, local_expert_idx);
 #endif
             } else {
-                st_na_release(reinterpret_cast<int*>(rdma_recv_flag + global_expert_idx), 1);
+                st_na_release(reinterpret_cast<int64_t*>(rdma_recv_flag + global_expert_idx), 1);
             }
             atomic_add_release_global(atomic_clean_flag, -1);
         }
