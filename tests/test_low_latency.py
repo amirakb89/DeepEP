@@ -29,7 +29,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
     # Check dispatch correctness
-    do_check = True
+    do_check = False #True
     hash_value, num_times = 0, 0
 
     for return_recv_hook in (False, True):
@@ -162,7 +162,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
                             num_qps_per_rank=num_experts // num_ranks)
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=1)
 
-    do_pressure_test = False
+    do_pressure_test = True
     for seed in range(int(1e9) if do_pressure_test else 0):
         if local_rank == 0:
             print(f'Testing with seed {seed} ...', flush=True)

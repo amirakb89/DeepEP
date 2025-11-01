@@ -531,6 +531,16 @@ __device__ __forceinline__ void st_na_relaxed(const int *ptr, int val) {
 #endif
 }
 
+__device__ __forceinline__ void st_na_relaxed(const int64_t *ptr, int val) {
+#ifdef USE_ROCM
+    int64_t* non_const_ptr = const_cast<int64_t*>(ptr);
+    __hip_atomic_store(non_const_ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+#else
+     asm volatile("st.relaxed.gpu.global.L1::no_allocate.b32 [%0], %1;" : : "l"(ptr), "r"(val));
+#endif
+}
+
+
 __device__ __forceinline__ void st_na_relaxed(const int4 *ptr, int4 val) {
 #ifdef USE_ROCM
     int4* non_const_ptr = const_cast<int4*>(ptr);
