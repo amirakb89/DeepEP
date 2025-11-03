@@ -84,7 +84,12 @@ if __name__ == "__main__":
 
     # TODO: currently, we only support Hopper architecture, we may add Ampere support later
     if variant == "rocm":
-        os.environ["PYTORCH_ROCM_ARCH"] = os.getenv("PYTORCH_ROCM_ARCH", "gfx942")
+        arch = os.getenv("PYTORCH_ROCM_ARCH")
+        allowed_arch = {"gfx942", "gfx950"}
+        if arch not in allowed_arch:
+            raise EnvironmentError(
+                f"Invalid PYTORCH_ROCM_ARCH='{arch}'. "
+                f"Use one of: {', '.join(sorted(allowed_arch))}.")
     elif variant == "cuda":
         os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 

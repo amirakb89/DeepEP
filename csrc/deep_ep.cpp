@@ -45,6 +45,10 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
     // Get device info
     cudaDeviceProp device_prop = {};
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device_id));
+#ifdef USE_ROCM
+    sscanf(device_prop.gcnArchName, "gfx%d", &gfx);
+    EP_HOST_ASSERT(gfx >= 942);
+#endif
 
     if (num_nvl_bytes > 0) {
         // Local IPC: alloc local memory and set local IPC handle
@@ -1070,12 +1074,13 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         stream_wait(launch_stream, compute_stream);
 
     // Allocate packed tensors
+    auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
+                                    x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn: torch::kBFloat16));
 #ifdef USE_ROCM
-    auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-                                      x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fnuz: torch::kBFloat16));
-#else
-    auto packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
-                                      x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fn : torch::kBFloat16);
+    if (gfx == 942){
+        packed_recv_x = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank, hidden},
+                                    x.options().dtype(use_fp8 ? torch::kFloat8_e4m3fnuz: torch::kBFloat16));
+    }
 #endif
     auto packed_recv_src_info = torch::empty({num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank}, torch::dtype(torch::kInt32).device(torch::kCUDA));
     auto packed_recv_layout_range = torch::empty({num_local_experts, num_ranks}, torch::dtype(torch::kInt64).device(torch::kCUDA));

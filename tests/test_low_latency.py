@@ -35,7 +35,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     for return_recv_hook in (False, True):
         for dispatch_use_fp8 in (False, True):
             num_times += 1
-            for i in range((num_times % 2) + 1):
+            for i in range((num_times) + 1):
                 packed_recv_x, packed_recv_count, handle, event, hook = \
                     buffer.low_latency_dispatch(x, topk_idx, num_tokens, num_experts, use_fp8=dispatch_use_fp8,
                                                 async_finish=not return_recv_hook, return_recv_hook=return_recv_hook)
@@ -76,7 +76,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
             # Check combine correctness
-            for zero_copy in (False, True):
+            for zero_copy in (False,True):
                 if zero_copy:
                     buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
                 out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
@@ -110,8 +110,8 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     # noinspection PyShadowingNames
     def test_func(zero_copy: bool, return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = \
-            buffer.low_latency_dispatch(x, topk_idx, num_tokens, num_experts,
-                                        async_finish=False, return_recv_hook=return_recv_hook)
+            buffer.low_latency_dispatch(x, topk_idx, num_tokens, num_experts, use_fp8=True,
+                                                async_finish=False, return_recv_hook=return_recv_hook)
         large_gemm_with_hook(hook) if return_recv_hook else None
         if zero_copy:
             buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
@@ -128,7 +128,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         num_combine_comm_bytes += num_bf16_bytes * num_selections
 
     # Dispatch + combine testing
-    avg_t, min_t, max_t = bench(partial(test_func, zero_copy=False, return_recv_hook=False))
+    avg_t, min_t, max_t = bench(partial(test_func, zero_copy=zero_copy, return_recv_hook=False))
     print(f'[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, '
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
@@ -136,7 +136,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
     for return_recv_hook in (False, True):
         group.barrier()
 
-        dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
+        dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=False, return_recv_hook=return_recv_hook),
                                              kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
                                              suppress_kineto_output=True)
         if not return_recv_hook:
