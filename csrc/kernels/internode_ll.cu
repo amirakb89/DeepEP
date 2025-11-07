@@ -19,9 +19,10 @@ namespace internode_ll {
 __device__ void grid_barrier(int* global_counter, int num_blocks) {
 volatile int ret;
     __syncthreads();
-    __threadfence();
-    if (threadIdx.x == 0 ) {
-        ret = __hip_atomic_fetch_add( &global_counter[0], 1,
+       if (threadIdx.x == 0 ) {
+              __threadfence();
+ 
+	       ret = __hip_atomic_fetch_add( &global_counter[0], 1,
                             __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     __syncthreads();
@@ -120,18 +121,18 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
-#ifdef USE_ROCM
-    // 16 is the max possible number of warps in AMD GPUs 
-    constexpr int kMaxNumWarps = 1024 / kWarpSize;
-    constexpr int num_sync_large_iteration = kMaxNumWarps ;
-    __shared__ volatile uint8_t sync_large_warp_counters[num_sync_large_iteration];
-
-    #pragma unroll
-    for (int i = thread_id; i < num_sync_large_iteration; i += blockDim.x) {
-        sync_large_warp_counters[i] = 0;
-    }
-    __syncthreads();
-#endif
+//#ifdef USE_ROCM
+//    // 16 is the max possible number of warps in AMD GPUs 
+//    constexpr int kMaxNumWarps = 1024 / kWarpSize;
+//    constexpr int num_sync_large_iteration = kMaxNumWarps ;
+//    __shared__ volatile uint8_t sync_large_warp_counters[num_sync_large_iteration];
+//
+//    #pragma unroll
+//    for (int i = thread_id; i < num_sync_large_iteration; i += blockDim.x) {
+//        sync_large_warp_counters[i] = 0;
+//    }
+//    __syncthreads();
+//#endif
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
         goto LOW_LATENCY_DISPATCH_RECV;
@@ -165,7 +166,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 // Read
                 auto int4_value = __ldg(x_int4 + i);
 
-                if (kUseFP8) {
+                if constexpr(kUseFP8) {
                     // Calculate local amax
                     auto bf16_values = reinterpret_cast<gpu_bfloat16_t*>(&int4_value);
                     float fp32_values[kNumElemsPerRead];
@@ -267,10 +268,10 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 next_clean[i] = 0;
 
             // Notify before executing `int_p`
-            syncwarp();
-            #pragma unroll
-            for (int i = lane_id; i < num_experts; i += kWarpSize)
-                atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
+            //syncwarp();
+            //#pragma unroll
+            //for (int i = lane_id; i < num_experts; i += kWarpSize)
+            //    atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
         }
         // This SM should be responsible for some destination experts, read `topk_idx` for them
         int expert_count[kNumWarpGroups] = {0};
@@ -278,7 +279,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto expert_end_idx = min(expert_begin_idx + kNumWarpGroups, num_experts);
 
         // Per lane count
-        #pragma unroll 8
+        #pragma unroll 2
         for (int i = lane_id; i < num_tokens * num_topk; i += kWarpSize) {
             auto idx = static_cast<int>(__ldg(topk_idx + i));
             if (idx >= expert_begin_idx and idx < expert_end_idx)
@@ -296,6 +297,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
     }
 
+#if 0
     if (thread_id == 0 and num_ranks > 8){
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmem_fence();
@@ -303,6 +305,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     internode::shmem_ctx_quiet(ctx);
 #endif
     }
+#endif
     //revert sync_large_warp_counters to 0 for next sync
     __syncthreads();
 
@@ -313,7 +316,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
 
         // Wait local sends issued and send expert counts
-        while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
+        while (ld_volatile_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG);
         if (dst_rank != rank) {
 #ifdef USE_ROCM
 #if defined(ROCM_DISABLE_CTX)
@@ -377,13 +380,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
 #ifdef USE_ROCM
         // no needs to reset because there is no iteration
-        if (lane_id == 0){
-            volatile int ret = __hip_atomic_fetch_add(
-                &sync_large_warp_counters[warp_group_id], 1,
-                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-        }
-        syncwarp();
-        while (sync_large_warp_counters[warp_group_id] < (kNumWarpsPerGroup));
+     //   if (lane_id == 0){
+     //       volatile int ret = __hip_atomic_fetch_add(
+     //           &sync_large_warp_counters[warp_group_id], 1,
+     //           __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+     //   }
+     //   syncwarp();
+     //   while (sync_large_warp_counters[warp_group_id] < (kNumWarpsPerGroup));
+	  __syncthreads();
 #else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 2), "r"(kNumWarpsPerGroup * 32));
 #endif
@@ -406,7 +410,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
 
             // Copy scales
-            if (kUseFP8) {
+            if constexpr(kUseFP8) {
                 const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
                 const auto dst_scales = reinterpret_cast<float*>(recv_x_scales + recv_token_begin_idx + i);
                 const auto scale_stride = num_ranks * num_max_dispatch_tokens_per_rank;
