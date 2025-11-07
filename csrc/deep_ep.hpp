@@ -65,6 +65,10 @@ private:
     // Workspace
     void* workspace = nullptr;
 
+    // global_atomic_counter
+    int* dispatch_global_atomic_counter = nullptr;
+    int* combine_global_atomic_counter = nullptr;
+
     // Host-side MoE info
     volatile int* moe_recv_counter = nullptr;
     int* moe_recv_counter_mapped = nullptr;
