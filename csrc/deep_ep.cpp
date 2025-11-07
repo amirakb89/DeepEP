@@ -77,6 +77,17 @@ Buffer::Buffer(int rank, int num_ranks, int64_t num_nvl_bytes, int64_t num_rdma_
 #endif
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
 
+    // global_atomic_counter for grid_barrier
+#ifdef USE_ROCM
+    CUDA_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&dispatch_global_atomic_counter), sizeof(int), hipDeviceMallocUncached));
+    CUDA_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&combine_global_atomic_counter), sizeof(int), hipDeviceMallocUncached));
+#else
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dispatch_global_atomic_counter), sizeof(int)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&combine_global_atomic_counter), sizeof(int)));
+#endif
+    CUDA_CHECK(cudaMemsetAsync(dispatch_global_atomic_counter, 0, sizeof(int), comm_stream));
+    CUDA_CHECK(cudaMemsetAsync(combine_global_atomic_counter, 0, sizeof(int), comm_stream));
+
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_counter_mapped), const_cast<int*>(moe_recv_counter), 0));
@@ -126,6 +137,8 @@ Buffer::~Buffer() noexcept(false) {
 
     // Free cuBLAS handle, workspace and MoE counter
     CUDA_CHECK(cudaFree(workspace));
+    CUDA_CHECK(cudaFree(dispatch_global_atomic_counter));
+    CUDA_CHECK(cudaFree(combine_global_atomic_counter));
     CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_counter)));
 
     // Free chunked mode staffs
@@ -1063,12 +1076,12 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
     EP_HOST_ASSERT(nvl_layout.total_bytes <= num_rdma_bytes);
     auto nvl_buffer = nvl_layout.buffers[low_latency_buffer_idx ^= 1];
     auto nvl_next_buffer = nvl_layout.buffers[low_latency_buffer_idx ^= 1];
-    auto global_atomic_counter = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
 	
     // Wait previous tasks to be finished
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    cudaMemsetAsync(dispatch_global_atomic_counter, 0, sizeof(int), launch_stream);
     EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
@@ -1102,7 +1115,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x, const torch::Tensor& topk_i
         internode_ll::dispatch(packed_recv_x.data_ptr(), packed_recv_x_scales_ptr,
                             packed_recv_src_info.data_ptr<int>(), packed_recv_layout_range.data_ptr<int64_t>(),
                             packed_recv_count.data_ptr<int>(),
-                            global_atomic_counter.data_ptr<int>(),
+                            dispatch_global_atomic_counter,
                             buffer.dispatch_rdma_recv_data_buffer, buffer.dispatch_rdma_recv_count_buffer,
                             buffer.dispatch_rdma_send_buffer,
                             x.data_ptr(), topk_idx.data_ptr<int64_t>(),
@@ -1164,7 +1177,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     auto hidden = static_cast<int>(x.size(2));
     auto num_local_experts = num_experts / num_ranks, num_topk = static_cast<int>(topk_weights.size(1));
     auto num_combined_tokens = static_cast<int>(topk_weights.size(0));
-    auto global_atomic_counter = torch::zeros({1}, torch::dtype(torch::kInt32).device(torch::kCUDA));
+
     // Buffer control
     LowLatencyLayout layout(rdma_buffer_ptr, num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts);
     EP_HOST_ASSERT(layout.total_bytes <= num_rdma_bytes);
@@ -1181,6 +1194,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
+    cudaMemsetAsync(combine_global_atomic_counter, 0, sizeof(int), launch_stream);
     EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
@@ -1204,7 +1218,7 @@ Buffer::low_latency_combine(const torch::Tensor& x, const torch::Tensor& topk_id
                               buffer.combine_rdma_send_buffer,
                               x.data_ptr(), topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
                               src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
-                              global_atomic_counter.data_ptr<int>(),
+                              combine_global_atomic_counter,
                               next_clean_meta.first, next_clean_meta.second,
                               num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
                               num_topk, num_experts, rank, num_ranks,
