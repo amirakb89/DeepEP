@@ -232,18 +232,22 @@ __device__ __forceinline__ int ld_acquire_global(const int *ptr) {
     return ret;
 }
 //not used
-__device__ __forceinline__ int atomic_add_release_sys_global(const int* ptr, int value) {
-    int ret;
-#ifndef USE_ROCM
-    asm volatile("atom.add.release.sys.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
-#endif
-    return ret;
-}
-//inter
+
 __device__ __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
     int ret;
 #ifdef USE_ROCM
     ret = __hip_atomic_fetch_add(const_cast<int*> (ptr), value, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+#else
+    asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
+#endif
+return ret;
+}
+
+//inter
+__device__ __forceinline__ int atomic_add_relaxed_global(const int* ptr, int value) {
+    int ret;
+#ifdef USE_ROCM
+    ret = __hip_atomic_fetch_add(const_cast<int*> (ptr), value, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
 #else
     asm volatile("atom.add.release.gpu.global.s32 %0, [%1], %2;" : "=r"(ret) : "l"(ptr), "r"(value));
 #endif

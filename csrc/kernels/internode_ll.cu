@@ -16,10 +16,11 @@ namespace deep_ep {
 
 namespace internode_ll {
 
-__device__ void grid_barrier(int* global_counter, int num_blocks) {
+__device__ void grid_barrier(int* global_counter, int num_blocks, int do_fence=1) {
 volatile int ret;
     __syncthreads();
        if (threadIdx.x == 0 ) {
+        if (do_fence)
               __threadfence();
  
 	       ret = __hip_atomic_fetch_add( &global_counter[0], 1,
@@ -511,21 +512,21 @@ combine(void* combined_x,
     // Message package
     // BF16 mode: always use BF16 for hidden data (ignoring the extra flag slot)
     constexpr size_t num_bytes_per_slot = sizeof(int4) + kHidden * sizeof(gpu_bfloat16_t);
-    EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
-    __syncthreads();
-#ifdef USE_ROCM
-    // 16 is the max possible number of warps in AMD GPUs 
-    constexpr int kMaxNumWarps = 1024 / kWarpSize;
-    __shared__ volatile int sync_large_warp_counters[kMaxNumWarps];
-    if (threadIdx.x==0){
-        // printf("combine");
-        #pragma unroll
-        for (int i = 0; i < kMaxNumWarps; ++i) {
-            sync_large_warp_counters[i] = 0;
-        }
-    }
-    __syncthreads();
-#endif
+    // EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
+//     __syncthreads();
+// #ifdef USE_ROCM
+//     // 16 is the max possible number of warps in AMD GPUs 
+//     constexpr int kMaxNumWarps = 1024 / kWarpSize;
+//     __shared__ volatile int sync_large_warp_counters[kMaxNumWarps];
+//     if (threadIdx.x==0){
+//         // printf("combine");
+//         #pragma unroll
+//         for (int i = 0; i < kMaxNumWarps; ++i) {
+//             sync_large_warp_counters[i] = 0;
+//         }
+//     }
+//     __syncthreads();
+// #endif
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -540,7 +541,7 @@ combine(void* combined_x,
         // Notify before executing `int_p`
         syncwarp();
         if (lane_id == 0)
-            atomic_add_release_global(atomic_clean_flag, num_experts);
+            atomic_add_relaxed_global(atomic_clean_flag, num_experts);
     }
 
     // Issue IBGDA sends
@@ -571,11 +572,11 @@ combine(void* combined_x,
             const auto dst_ptr = reinterpret_cast<uint64_t>(rdma_recv_x) + (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot + sizeof(int4);
             if (dst_rank == rank) {
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
-                UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
+                UNROLLED_WARP_COPY(4, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
             } else {
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                 if (not zero_copy)
-                    UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
+                    UNROLLED_WARP_COPY(4, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
                 
                 //nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, hidden * sizeof(gpu_bfloat16_t), dst_rank, local_expert_idx, lane_id, token_idx - offset);
 #if defined(ROCM_DISABLE_CTX)
@@ -584,6 +585,7 @@ combine(void* combined_x,
                     internode::shmem_ctx_schar_put_nbi_warp(ctx,
 #endif
                     reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
+#if 0
                 if (num_ranks > 8){
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmem_fence();
@@ -591,24 +593,26 @@ combine(void* combined_x,
                     internode::shmem_ctx_quiet(ctx);
 #endif
                 }
+#endif //0
             }
         }
 
         // Put finishing flag
-        EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
+        // EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
 #ifdef USE_ROCM
-        if (lane_id == 0){
-        volatile int ret = __hip_atomic_fetch_add(
-            &sync_large_warp_counters[warp_group_id], 1,
-            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
-        }
-        syncwarp();
-        while (sync_large_warp_counters[warp_group_id] < (kNumWarpsPerGroup));
+        // if (lane_id == 0){
+        // volatile int ret = __hip_atomic_fetch_add(
+        //     &sync_large_warp_counters[warp_group_id], 1,
+        //     __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_WORKGROUP);
+        // }
+        // syncwarp();
+        // while (sync_large_warp_counters[warp_group_id] < (kNumWarpsPerGroup));
+        __syncthreads();
 #else
         asm volatile("bar.sync %0, %1;" :: "r"(warp_group_id + 1), "r"(kNumWarpsPerGroup * 32));
 #endif
-        if (sub_warp_id == 1 and lane_id == 0) {
-            while (ld_acquire_global(atomic_clean_flag) == 0);
+        if (sub_warp_id == 0 and lane_id == 0) {
+            while (ld_volatile_global(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
 #ifdef USE_ROCM
 #if defined(ROCM_DISABLE_CTX)
@@ -622,9 +626,9 @@ combine(void* combined_x,
             } else {
                 st_na_release(reinterpret_cast<int64_t*>(rdma_recv_flag + global_expert_idx), 1);
             }
-            atomic_add_release_global(atomic_clean_flag, -1);
+            atomic_add_relaxed_global(atomic_clean_flag, -1);
         }
-        syncwarp();
+        //syncwarp();
     }
 
     // Receiving phase
@@ -634,16 +638,16 @@ combine(void* combined_x,
 
     // Wait all ranks to arrive and notify PCIe usage
     if (responsible_expert_idx < num_experts) {
-        EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
+        // EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0){
-            while (ld_acquire_global(reinterpret_cast<int*>(rdma_recv_flag + responsible_expert_idx)) == 0);
+            while (ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
         }
     }
-    grid_barrier(global_atomic_counter, num_sms);
+    grid_barrier(global_atomic_counter, num_sms, 0);
 
     // Reduce tokens with FP8 cast
-    EP_DEVICE_ASSERT(num_topk <= kWarpSize and hidden_bf16_int4 <= num_threads);
-    EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumElemsPerInt4) == 0, "Invalid vectorization");
+    // EP_DEVICE_ASSERT(num_topk <= kWarpSize and hidden_bf16_int4 <= num_threads);
+    // EP_STATIC_ASSERT(kHidden % (kWarpSize * kNumElemsPerInt4) == 0, "Invalid vectorization");
     if (thread_id < hidden_bf16_int4) {
         for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
             // Read top-k indices and weights
@@ -665,7 +669,7 @@ combine(void* combined_x,
                 // Reduce
                 auto x_vec = ld_nc_global(reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id);
                 const auto x_bf16 = reinterpret_cast<gpu_bfloat16_t*>(&x_vec);
-                #pragma unroll
+                #pragma unroll 4
                 for (int j = 0; j < kNumElemsPerInt4; ++ j)
                     combined_values[j] += static_cast<float>(x_bf16[j]) * reg_topk_weights[i];
             }
@@ -673,7 +677,7 @@ combine(void* combined_x,
             // Write results
             int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
             auto combined_bf16 = reinterpret_cast<gpu_bfloat16_t*>(&combined_values);
-            #pragma unroll
+            #pragma unroll 4
             for (int j = 0; j < kNumElemsPerInt4; ++ j)
                 combined_bf16[j] = static_cast<gpu_bfloat16_t>(combined_values[j]);
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
@@ -695,8 +699,8 @@ void combine(void* combined_x,
              void* workspace, cudaStream_t stream,
              int phases, bool zero_copy) {
 #ifdef USE_ROCM
-    constexpr int kNumWarpsPerGroup = 4;
-    constexpr int kNumWarpGroups = 4;
+    constexpr int kNumWarpsPerGroup = 8;
+    constexpr int kNumWarpGroups = 2;
 #else
     constexpr int kNumWarpsPerGroup = 10;
     constexpr int kNumWarpGroups = 3;
