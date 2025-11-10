@@ -92,7 +92,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / kWarpSize, lane_id = get_lane_id();
     const auto num_sms = static_cast<int>(gridDim.x);
-    const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
+    constexpr auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const auto num_local_experts = num_experts / num_ranks;
     const auto warp_group_id = warp_id / kNumWarpsPerGroup;
     const auto sub_warp_id = warp_id % kNumWarpsPerGroup;
@@ -148,7 +148,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(gpu_bfloat16_t);
         EP_DEVICE_ASSERT(kHidden % kNumElemsPerRead == 0);
         EP_STATIC_ASSERT(kNumElemsPerRead * kWarpSize % kNumPerChannels == 0, "Invalid vectorization");
-        const auto num_threads = (num_warps - 1) * kWarpSize;
+        //const auto num_threads = (num_warps - 1) * kWarpSize;
+        constexpr int num_threads = kNumWarpGroups * kNumWarpsPerGroup * kWarpSize; 
         const size_t hidden_bf16_int4 = kHidden / kNumElemsPerRead;
 
         for (int token_idx = sm_id; token_idx < num_tokens; token_idx += num_sms) {
@@ -248,7 +249,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
-                    UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                    UNROLLED_WARP_COPY(4, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
                 }
 
                 // Increase counter after finishing
@@ -288,12 +289,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
 
         // Warp reduce
-        #pragma unroll
+        #pragma unroll 2
         for (int i = expert_begin_idx; i < expert_end_idx; ++ i) {
             auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
             if (lane_id == 0) {
                 shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
-                atomic_add_release_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+                atomic_add_relaxed_global(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
             }
         }
     }
@@ -321,7 +322,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank != rank) {
 #ifdef USE_ROCM
 #if defined(ROCM_DISABLE_CTX)
-           internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+           //internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+           rocshmem::rocshmem_long_p(        rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+           
 #else
            internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
 #endif
@@ -340,7 +343,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank == 0)
             packed_recv_count[dst_expert_local_idx] = 0;
     }
-    syncwarp();
+    //syncwarp();
 
     // Receiving phase
     LOW_LATENCY_DISPATCH_RECV:
@@ -371,8 +374,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         // NOTES: using sub-warp 1 to overlap with sub-warp 0
         int num_recv_tokens, recv_token_begin_idx;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
-        if (sub_warp_id == 1 and lane_id == 0) {
-            while ((num_recv_tokens = ld_acquire_global(reinterpret_cast<int*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0);
+        if (sub_warp_id == 0 and lane_id == 0) {
+            while ((num_recv_tokens = ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0);
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
             shared_num_recv_tokens[warp_group_id] = num_recv_tokens;
@@ -408,7 +411,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             // NOTES: only 2 load iterations for 7K hidden with 7 unrolls
             const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
             const auto dst_data = recv_x_int4 + (recv_token_begin_idx + i) * hidden_int4;
-            UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
+            UNROLLED_WARP_COPY(8, lane_id, hidden_int4, dst_data, src_data, ld_nc_global, st_na_global);
 
             // Copy scales
             if constexpr(kUseFP8) {
@@ -439,14 +442,14 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               void* workspace, cudaStream_t stream, int phases) {
 
 #ifdef USE_ROCM
-    constexpr int kNumWarpsPerGroup = 5;
+    constexpr int kNumWarpsPerGroup = 8;
     constexpr int kNumWarpGroups = 2;
 #else
     constexpr int kNumWarpsPerGroup = 10;
     constexpr int kNumWarpGroups = 3;
 #endif
     constexpr int kNumMaxTopK = 9;
-    EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
+    // EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const auto num_sms = cell_div(num_experts, kNumWarpGroups);
@@ -616,7 +619,8 @@ combine(void* combined_x,
             if (dst_rank != rank) {
 #ifdef USE_ROCM
 #if defined(ROCM_DISABLE_CTX)
-                internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
+                //internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
+                rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #else
                 internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #endif
@@ -643,7 +647,7 @@ combine(void* combined_x,
             while (ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_flag + responsible_expert_idx)) == 0);
         }
     }
-    grid_barrier(global_atomic_counter, num_sms, 0);
+    grid_barrier(global_atomic_counter, num_sms, 1);
 
     // Reduce tokens with FP8 cast
     // EP_DEVICE_ASSERT(num_topk <= kWarpSize and hidden_bf16_int4 <= num_threads);

@@ -231,6 +231,15 @@ __device__ __forceinline__ int ld_acquire_global(const int *ptr) {
 #endif
     return ret;
 }
+__device__ __forceinline__ int ld_acquire_global(const int64_t *ptr) {
+    int64_t ret;
+#ifdef USE_ROCM
+    ret = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+#else    
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+#endif
+    return ret;
+}
 //not used
 
 __device__ __forceinline__ int atomic_add_release_global(const int* ptr, int value) {
