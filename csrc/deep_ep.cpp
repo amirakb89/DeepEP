@@ -94,6 +94,17 @@ Buffer::Buffer(int rank,
 #endif
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
 
+    // global_atomic_counter for grid_barrier
+#ifdef USE_ROCM
+    CUDA_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&dispatch_global_atomic_counter), sizeof(int), hipDeviceMallocUncached));
+    CUDA_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&combine_global_atomic_counter), sizeof(int), hipDeviceMallocUncached));
+#else
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&dispatch_global_atomic_counter), sizeof(int)));
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&combine_global_atomic_counter), sizeof(int)));
+#endif
+    CUDA_CHECK(cudaMemsetAsync(dispatch_global_atomic_counter, 0, sizeof(int), comm_stream));
+    CUDA_CHECK(cudaMemsetAsync(combine_global_atomic_counter, 0, sizeof(int), comm_stream));
+
     // MoE counter
     CUDA_CHECK(cudaMallocHost(&moe_recv_counter, sizeof(int64_t), cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer(reinterpret_cast<void**>(&moe_recv_counter_mapped), const_cast<int*>(moe_recv_counter), 0));
@@ -120,6 +131,27 @@ Buffer::~Buffer() noexcept(false) {
         printf("WARNING: destroy() was not called before DeepEP buffer destruction, which can leak resources.\n");
         fflush(stdout);
     }
+
+    // Free NVSHMEM
+    if (num_rdma_bytes > 0) {
+        CUDA_CHECK(cudaDeviceSynchronize());
+        internode::barrier();
+        internode::free(rdma_buffer_ptr);
+        internode::finalize();
+    }
+
+    // Free cuBLAS handle, workspace and MoE counter
+    CUDA_CHECK(cudaFree(workspace));
+    CUDA_CHECK(cudaFree(dispatch_global_atomic_counter));
+    CUDA_CHECK(cudaFree(combine_global_atomic_counter));
+    CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_counter)));
+
+    // Free chunked mode staffs
+    CUDA_CHECK(cudaFreeHost(const_cast<int*>(moe_recv_expert_counter)));
+}
+
+void Buffer::move_fifo_slots(int num_slots) {
+    head = (head + num_ranks * num_slots) % NUM_MAX_FIFO_SLOTS;
 }
 
 bool Buffer::is_available() const {
@@ -1487,7 +1519,8 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not(async and return_recv_hook));
+    cudaMemsetAsync(dispatch_global_atomic_counter, 0, sizeof(int), launch_stream);
+    EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
@@ -1640,7 +1673,8 @@ std::tuple<torch::Tensor, std::optional<EventHandle>, std::optional<std::functio
     // NOTES: the hook mode will always use the default stream
     auto compute_stream = at::cuda::getCurrentCUDAStream();
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
-    EP_HOST_ASSERT(not(async and return_recv_hook));
+    cudaMemsetAsync(combine_global_atomic_counter, 0, sizeof(int), launch_stream);
+    EP_HOST_ASSERT(not (async and return_recv_hook));
     if (not return_recv_hook)
         stream_wait(launch_stream, compute_stream);
 
