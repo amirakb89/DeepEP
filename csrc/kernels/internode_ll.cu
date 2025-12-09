@@ -328,7 +328,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         } else {
             st_na_release(reinterpret_cast<int64_t *>(rdma_recv_count + dst_expert_local_idx * num_ranks + rank), -num_tokens_sent - 1);
         }
-
+        if constexpr (multinode){
+#if defined(ROCM_DISABLE_CTX)
+                    internode::shmem_fence();
+#else
+                    internode::shmem_ctx_quiet(ctx);
+#endif
+    }
+ 
         // Clean workspace for next use
         atomic_counter_per_expert[responsible_expert_idx] = 0;
         atomic_finish_counter_per_expert[responsible_expert_idx] = 0;
@@ -369,10 +376,19 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         int num_recv_tokens, recv_token_begin_idx;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         if (sub_warp_id == 0 and lane_id == 0) {
+            auto start_time = clock64();
             if constexpr (multinode){
-                while ((num_recv_tokens = ld_acquire_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0);
+                while ((num_recv_tokens = ld_acquire_sys_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
+                     if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
+                         printf("dispatch recieve time out \n");
+                    }
+                }
             }else{
-                while ((num_recv_tokens = ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0);
+                while ((num_recv_tokens = ld_volatile_global(reinterpret_cast<int64_t*>(rdma_recv_count + local_expert_idx * num_ranks + src_rank))) == 0){
+                         if ((clock64() - start_time) >= NUM_TIMEOUT_CYCLES){
+                         printf("dispatch recieve single node time out \n");
+                    }
+                }
             }
             num_recv_tokens = -num_recv_tokens - 1;
             recv_token_begin_idx = atomicAdd(packed_recv_count + local_expert_idx, num_recv_tokens);
