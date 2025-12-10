@@ -3,7 +3,7 @@ name: One-way Sync - Develop to Public Main
 on:
   push:
     branches:
-      - develop
+      - oneway-sync-workflows
   workflow_dispatch:
 
 permissions:
@@ -47,10 +47,10 @@ jobs:
 
           if [ "$COMMITS_AHEAD" -eq 0 ]; then
             echo "status=in_sync" >> $GITHUB_OUTPUT
-            echo "✅ Branches are already in sync"
+            echo "Branches are already in sync"
           else
             echo "status=needs_sync" >> $GITHUB_OUTPUT
-            echo "📦 $COMMITS_AHEAD commit(s) to sync"
+            echo "$COMMITS_AHEAD commit(s) to sync"
           fi
 
       - name: Check for merge conflicts
@@ -63,7 +63,7 @@ jobs:
           # Attempt merge with --no-commit to check for conflicts
           if git merge --no-commit --no-ff develop 2>/dev/null; then
             echo "conflict=false" >> $GITHUB_OUTPUT
-            echo "✅ No conflicts detected"
+            echo "No conflicts detected"
             # Abort the test merge
             git merge --abort || true
           else
@@ -101,14 +101,14 @@ jobs:
         if: steps.check_status.outputs.status == 'needs_sync' && steps.conflict_check.outputs.conflict == 'false'
         run: |
           git push public-repo main-sync:main
-          echo "✅ Successfully synced develop to public DeepEP:main"
+          echo "Successfully synced develop to public DeepEP:main"
 
       - name: Summary
         run: |
           if [ "${{ steps.check_status.outputs.status }}" == "in_sync" ]; then
             echo "ℹ️ No sync needed - branches already in sync"
           elif [ "${{ steps.conflict_check.outputs.conflict }}" == "true" ]; then
-            echo "❌ Sync failed due to conflicts - manual resolution required"
+            echo "Sync failed due to conflicts - manual resolution required"
           else
-            echo "✅ Sync completed successfully"
+            echo "Sync completed successfully"
           fi
