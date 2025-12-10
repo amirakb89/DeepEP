@@ -61,7 +61,7 @@ jobs:
           git checkout -b temp-main-sync public-repo/test-main
 
           # Attempt merge with --no-commit to check for conflicts
-          if git merge --no-commit --no-ff develop 2>/dev/null; then
+          if git merge --no-commit --no-ff oneway-sync-workflows 2>/dev/null; then
             echo "conflict=false" >> $GITHUB_OUTPUT
             echo "No conflicts detected"
             # Abort the test merge
@@ -74,7 +74,7 @@ jobs:
             echo "MANUAL INTERVENTION REQUIRED"
             echo "=========================================="
             echo "Conflicts exist between:"
-            echo "  - Source: ROCm/deepEP_private:develop"
+            echo "  - Source: ROCm/deepEP_private:oneway-sync-workflow"
             echo "  - Target: ROCm/DeepEP:main"
             echo ""
             echo "Please resolve conflicts manually before syncing."
@@ -89,11 +89,11 @@ jobs:
           # Switch to main branch from public repo
           git checkout -b test-main-sync public-repo/test-main
 
-          DEVELOP_COMMIT=$(git rev-parse develop)
+          DEVELOP_COMMIT=$(git rev-parse oneway-sync-workflows)
 
           # Merge develop into main
-          git merge develop -m "Sync: Merge from deepEP_private:develop to DeepEP:test-main
-
+          #git merge develop -m "Sync: Merge from deepEP_private:develop to DeepEP:test-main
+          git merge oneway-sync-workflows -m "Sync: Merge from deepEP_private:oneway-sync-workflows
           Auto-sync via GitHub Actions
           Source commit: $DEVELOP_COMMIT"
 
