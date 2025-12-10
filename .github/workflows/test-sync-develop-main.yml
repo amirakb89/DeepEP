@@ -1,9 +1,9 @@
-name: One-way Sync - Develop to Public Main
+name: Test One-way Sync - Develop to Public Main
 
 on:
   push:
     branches:
-      - develop
+      - oneway-sync-workflows
   workflow_dispatch:
 
 permissions:
@@ -30,19 +30,19 @@ jobs:
       - name: Add public DeepEP remote
         run: |
           git remote add public-repo https://${{ secrets.SYNC_PAT_TOKEN }}@github.com/ROCm/DeepEP.git
-          git fetch public-repo main
+          git fetch public-repo test-main
 
       - name: Check sync status
         id: check_status
         run: |
           DEVELOP_COMMIT=$(git rev-parse HEAD)
-          PUBLIC_MAIN_COMMIT=$(git rev-parse public-repo/main)
+          PUBLIC_MAIN_COMMIT=$(git rev-parse public-repo/test-main)
 
           echo "Develop HEAD: $DEVELOP_COMMIT"
           echo "Public main HEAD: $PUBLIC_MAIN_COMMIT"
 
           # Check if develop has commits not in public/main
-          COMMITS_AHEAD=$(git rev-list --count public-repo/main..HEAD)
+          COMMITS_AHEAD=$(git rev-list --count public-repo/test-main..HEAD)
           echo "Commits ahead: $COMMITS_AHEAD"
 
           if [ "$COMMITS_AHEAD" -eq 0 ]; then
@@ -58,7 +58,7 @@ jobs:
         if: steps.check_status.outputs.status == 'needs_sync'
         run: |
           # Create a temporary branch from public/main
-          git checkout -b temp-main-sync public-repo/main
+          git checkout -b temp-main-sync public-repo/test-main
 
           # Attempt merge with --no-commit to check for conflicts
           if git merge --no-commit --no-ff develop 2>/dev/null; then
@@ -87,12 +87,12 @@ jobs:
         if: steps.check_status.outputs.status == 'needs_sync' && steps.conflict_check.outputs.conflict == 'false'
         run: |
           # Switch to main branch from public repo
-          git checkout -b main-sync public-repo/main
+          git checkout -b test-main-sync public-repo/test-main
 
           DEVELOP_COMMIT=$(git rev-parse develop)
 
           # Merge develop into main
-          git merge develop -m "Sync: Merge from deepEP_private:develop to DeepEP:main
+          git merge develop -m "Sync: Merge from deepEP_private:develop to DeepEP:test-main
 
           Auto-sync via GitHub Actions
           Source commit: $DEVELOP_COMMIT"
@@ -100,7 +100,7 @@ jobs:
       - name: Push to public repository
         if: steps.check_status.outputs.status == 'needs_sync' && steps.conflict_check.outputs.conflict == 'false'
         run: |
-          git push public-repo main-sync:main
+          git push public-repo test-main-sync:test-main
           echo "Successfully synced develop to public DeepEP:main"
 
       - name: Summary
