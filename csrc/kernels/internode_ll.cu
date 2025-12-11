@@ -288,15 +288,15 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
     }
 
-    if constexpr (multinode){
-        if (thread_id == 0 ){
-#if defined(ROCM_DISABLE_CTX)
-                    internode::shmem_fence();
-#else
-                    internode::shmem_ctx_quiet(ctx);
-#endif
-        }
-    }
+//    if constexpr (multinode){
+//        if (thread_id == 0 ){
+//#if defined(ROCM_DISABLE_CTX)
+//                    internode::shmem_fence();
+//#else
+//                    internode::shmem_ctx_quiet(ctx);
+//#endif
+//        }
+//    }
     __syncthreads();
 
     // Issue count sends
@@ -598,7 +598,6 @@ combine(void* combined_x,
                     internode::shmem_ctx_quiet(ctx);
 #endif
                 }
-
             }
         }
 

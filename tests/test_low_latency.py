@@ -29,7 +29,7 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
         topk_idx[random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)] = -1
 
     # Check dispatch correctness
-    do_check = False
+    do_check = True
     hash_value, num_times = 0, 0
 
     for return_recv_hook in (False, True):
@@ -76,19 +76,19 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
             # Check combine correctness
-            #for zero_copy in (False,True):
-            #    if zero_copy:
-            #        buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
-            #    out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-            #    combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
-            #                                                         async_finish=not return_recv_hook,
-            #                                                         return_recv_hook=return_recv_hook, out=out)
-            #    hook() if return_recv_hook else event.current_stream_wait()
-            #    if do_check:
-            #        diff = calc_diff(x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
-            #        assert torch.isnan(combined_x).sum().item() == 0
-            #        assert diff < 1e-5, f'Error: diff={diff}'
-            #        hash_value ^= hash_tensor(combined_x)
+            for zero_copy in (False,True):
+                if zero_copy:
+                    buffer.get_next_low_latency_combine_buffer(handle)[:, :, :] = simulated_gemm_x
+                out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
+                combined_x, event, hook = buffer.low_latency_combine(simulated_gemm_x, topk_idx, topk_weights, handle,
+                                                                     async_finish=not return_recv_hook,
+                                                                     return_recv_hook=return_recv_hook, out=out)
+                hook() if return_recv_hook else event.current_stream_wait()
+                if do_check:
+                    diff = calc_diff(x * topk_weights.masked_fill(topk_idx == -1, 0).sum(dim=1).view(-1, 1), combined_x)
+                    assert torch.isnan(combined_x).sum().item() == 0
+                    assert diff < 1e-5, f'Error: diff={diff}'
+                    hash_value ^= hash_tensor(combined_x)
 
     def create_test_cast_with_outliers(num_outliers):
         tmp = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
