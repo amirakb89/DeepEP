@@ -69,16 +69,6 @@ jobs:
           else
             echo "conflict=true" >> $GITHUB_OUTPUT
             echo "CONFLICT DETECTED - Sync halted!"
-            echo ""
-            echo "=========================================="
-            echo "MANUAL INTERVENTION REQUIRED"
-            echo "=========================================="
-            echo "Conflicts exist between:"
-            echo "  - Source: ROCm/deepEP_private:develop"
-            echo "  - Target: ROCm/DeepEP:main"
-            echo ""
-            echo "Please resolve conflicts manually before syncing."
-            echo "=========================================="
             git merge --abort || true
             exit 1
           fi
@@ -106,7 +96,7 @@ jobs:
       - name: Summary
         run: |
           if [ "${{ steps.check_status.outputs.status }}" == "in_sync" ]; then
-            echo "ℹ️ No sync needed - branches already in sync"
+            echo "No sync needed - branches already in sync"
           elif [ "${{ steps.conflict_check.outputs.conflict }}" == "true" ]; then
             echo "Sync failed due to conflicts - manual resolution required"
           else
