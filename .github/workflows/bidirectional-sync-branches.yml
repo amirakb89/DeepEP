@@ -1,0 +1,189 @@
+name: Bi-directional Branch Sync
+
+on:
+  push:
+    branches:
+      #- develop-ali
+      - test-sync-deepep
+  
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      sync_direction:
+        description: 'Sync direction'
+        required: true
+        default: 'push-to-ali'
+        type: choice
+        options:
+          - push-to-ali
+          - pull-from-ali
+  
+  # Trigger from ali_amd_aisw repository via repository_dispatch
+  repository_dispatch:
+    types: [sync-from-shared]
+
+env:
+  SOURCE_REPO: ROCm/deepEP_private
+  #SOURCE_BRANCH: develop-ali
+  SOURCE_BRANCH: test-sync-deepep
+  TARGET_REPO: ROCm/ali_amd_aisw
+  #TARGET_BRANCH: deepep/ali-eic-1023-update
+  TARGET_BRANCH: test-sync-ali
+
+jobs:
+  sync-to-shared:
+    name: Sync develop-ali → ali-eic-1023-update
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' || 
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.sync_direction == 'push-to-ali')
+    
+    steps:
+      - name: Checkout deepEP_private (source)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ secrets.SYNC_PAT_TOKEN }}
+          fetch-depth: 0
+          path: source
+
+      - name: Checkout ali_amd_aisw (target)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ secrets.SYNC_PAT_TOKEN }}
+          fetch-depth: 0
+          path: target
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+
+      - name: Sync changes to ali_amd_aisw
+        id: sync
+        run: |
+          cd target
+          
+          # Add source as remote
+          git remote add source ../source
+          git fetch source ${{ env.SOURCE_BRANCH }}
+          
+          # Check if there are differences
+          if git diff --quiet HEAD source/${{ env.SOURCE_BRANCH }}; then
+            echo "No changes to sync"
+            echo "changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "changes=true" >> $GITHUB_OUTPUT
+          
+          # Try to merge (fast-forward preferred, but allow merge commit)
+          if ! git merge source/${{ env.SOURCE_BRANCH }} --no-edit -m "Sync from ${{ env.SOURCE_REPO }}/${{ env.SOURCE_BRANCH }}"; then
+            echo "::error::Merge conflict detected! Manual resolution required."
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            git merge --abort
+            exit 1
+          fi
+          
+          echo "conflict=false" >> $GITHUB_OUTPUT
+
+      - name: Push changes to ali_amd_aisw
+        if: steps.sync.outputs.changes == 'true' && steps.sync.outputs.conflict != 'true'
+        run: |
+          cd target
+          git push origin ${{ env.TARGET_BRANCH }}
+
+      - name: Notify on success
+        if: steps.sync.outputs.changes == 'true' && steps.sync.outputs.conflict != 'true'
+        run: |
+          echo "Successfully synced ${{ env.SOURCE_REPO }}/${{ env.SOURCE_BRANCH }} → ${{ env.TARGET_REPO }}/${{ env.TARGET_BRANCH }}"
+          echo "Commit: ${{ github.sha }}"
+
+      - name: Notify on conflict
+        if: failure() && steps.sync.outputs.conflict == 'true'
+        run: |
+          echo "SYNC FAILED: Merge conflict detected!"
+          echo "Source: ${{ env.SOURCE_REPO }}/${{ env.SOURCE_BRANCH }}"
+          echo "Target: ${{ env.TARGET_REPO }}/${{ env.TARGET_BRANCH }}"
+
+  sync-from-shared:
+    name: Sync ali-eic-1023-update → develop-ali
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'repository_dispatch' || 
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.sync_direction == 'pull-from-ali')
+    
+    steps:
+      - name: Checkout deepEP_private (target)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_BRANCH }}
+          token: ${{ secrets.SYNC_PAT_TOKEN }}
+          fetch-depth: 0
+          path: target
+
+      - name: Checkout ali_amd_aisw (source)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_REPO }}
+          ref: ${{ env.TARGET_BRANCH }}
+          token: ${{ secrets.SYNC_PAT_TOKEN }}
+          fetch-depth: 0
+          path: source
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+
+      - name: Sync changes to deepEP_private
+        id: sync
+        run: |
+          cd target
+          
+          # Add ali_amd_aisw as remote
+          git remote add shared ../source
+          git fetch shared ${{ env.TARGET_BRANCH }}
+          
+          # Check if there are differences
+          if git diff --quiet HEAD shared/${{ env.TARGET_BRANCH }}; then
+            echo "No changes to sync"
+            echo "changes=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          echo "changes=true" >> $GITHUB_OUTPUT
+          
+          # Try to merge (develop-ali takes priority, so we use ours strategy for conflicts)
+          # This will accept incoming changes but prefer develop-ali on conflicts
+          if ! git merge shared/${{ env.TARGET_BRANCH }} --no-edit -m "Sync from ${{ env.TARGET_REPO }}/${{ env.TARGET_BRANCH }}"; then
+            echo "::error::Merge conflict detected! Manual resolution required."
+            echo "conflict=true" >> $GITHUB_OUTPUT
+            git merge --abort
+            exit 1
+          fi
+          
+          echo "conflict=false" >> $GITHUB_OUTPUT
+
+      - name: Push changes to deepEP_private
+        if: steps.sync.outputs.changes == 'true' && steps.sync.outputs.conflict != 'true'
+        run: |
+          cd target
+          git push origin ${{ env.SOURCE_BRANCH }}
+
+      - name: Notify on success
+        if: steps.sync.outputs.changes == 'true' && steps.sync.outputs.conflict != 'true'
+        run: |
+          echo "Successfully synced ${{ env.TARGET_REPO }}/${{ env.TARGET_BRANCH }} → ${{ env.SOURCE_REPO }}/${{ env.SOURCE_BRANCH }}"
+
+      - name: Notify on conflict
+        if: failure() && steps.sync.outputs.conflict == 'true'
+        run: |
+          echo "SYNC FAILED: Merge conflict detected!"
+          echo "Source: ${{ env.TARGET_REPO }}/${{ env.TARGET_BRANCH }}"
+          echo "Target: ${{ env.SOURCE_REPO }}/${{ env.SOURCE_BRANCH }}"
+
