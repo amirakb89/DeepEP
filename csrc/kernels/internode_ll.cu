@@ -8,7 +8,7 @@
 #include <rocshmem/rocshmem.hpp>
 #include <iostream>
 // low latency+RocSHMEM has issue with CTX.
-#define ROCM_DISABLE_CTX
+//#define ROCM_DISABLE_CTX
 
 namespace cg = cooperative_groups;
 using namespace rocshmem;
@@ -98,7 +98,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
 #if !defined(ROCM_DISABLE_CTX)
     __shared__ internode::shmem_ctx_t ctx;
-    internode::shmem_wg_ctx_create(&ctx);
+if constexpr (multinode) { 
+   internode::shmem_wg_ctx_create(&ctx);
+}
 #endif
 
     // FP8 staffs
@@ -221,12 +223,26 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 if (dst_rank != rank) {
 
 #ifdef USE_ROCM
+                if constexpr (!multinode) {
+                    internode::shmemx_int8_put_nbi_warp(
+                        reinterpret_cast<signed char*>(dst_ptr),
+                        reinterpret_cast<signed char*>(src_ptr),
+                        num_bytes_per_msg, dst_rank);
+                } else {
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmemx_int8_put_nbi_warp(
+                        reinterpret_cast<signed char*>(dst_ptr),
+                        reinterpret_cast<signed char*>(src_ptr),
+                        num_bytes_per_msg, dst_rank);
 #else
-                    internode::shmem_ctx_schar_put_nbi_warp(ctx,
+                    internode::shmem_ctx_schar_put_nbi_warp(
+                        ctx,
+                        reinterpret_cast<signed char*>(dst_ptr),
+                        reinterpret_cast<signed char*>(src_ptr),
+                        num_bytes_per_msg, dst_rank);
 #endif
-                    reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(src_ptr), num_bytes_per_msg, dst_rank);
+                }
+            
 #else
                     nvshmemi_ibgda_put_nbi_warp(dst_ptr, src_ptr, num_bytes_per_msg, dst_rank, dst_expert_local_idx, lane_id, slot_idx);
 #endif
@@ -313,15 +329,15 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
         if (dst_rank != rank) {
 #ifdef USE_ROCM
-#if defined(ROCM_DISABLE_CTX)
-            if constexpr (multinode){
-                internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+           if constexpr (!multinode){
+               rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
             }else{
-                rocshmem::rocshmem_long_p(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
-            }
+#if defined(ROCM_DISABLE_CTX) 
+                internode::shmem_long_atomic_add( rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
 #else
-           internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
+                internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank);
 #endif
+            }
 #else //CUDA
            nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_count + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1, dst_rank, dst_expert_local_idx);
 #endif
@@ -348,9 +364,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
     // Receiving phase
     LOW_LATENCY_DISPATCH_RECV:
-    if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
+    if ((phases & LOW_LATENCY_RECV_PHASE) == 0){
+#if !defined(ROCM_DISABLE_CTX)
+        if constexpr (multinode)
+            internode::shmem_wg_ctx_destroy(&ctx);
+#endif
         return;
-
+    }
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
     if (phases & LOW_LATENCY_SEND_PHASE){
         grid_barrier(global_atomic_counter, num_sms);
@@ -432,6 +452,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
     }
 #if !defined(ROCM_DISABLE_CTX)
+if constexpr (multinode)
     internode::shmem_wg_ctx_destroy(&ctx);
 #endif
 }
@@ -509,6 +530,7 @@ combine(void* combined_x,
 
 #if !defined(ROCM_DISABLE_CTX)
     __shared__ internode::shmem_ctx_t ctx;
+if constexpr(multinode)
     internode::shmem_wg_ctx_create(&ctx);
 #endif
     const auto sm_id = static_cast<int>(blockIdx.x);
@@ -586,11 +608,15 @@ combine(void* combined_x,
                     UNROLLED_WARP_COPY(4, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
                 
                 //nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, hidden * sizeof(gpu_bfloat16_t), dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                if constexpr (!multinode){
+                    internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
+                }else{
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
 #else
                     internode::shmem_ctx_schar_put_nbi_warp(ctx,reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
 #endif
+                }
                 if constexpr (multinode){
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmem_fence();
@@ -617,16 +643,16 @@ combine(void* combined_x,
 
             if (dst_rank != rank) {
 #ifdef USE_ROCM
+                if constexpr (!multinode){
+                    rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
+               }else{
 #if defined(ROCM_DISABLE_CTX)
-            if constexpr (multinode){
-                internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
-            }else{
-                rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
-            }
+                    internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #else
-                internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_flag + global_expert_idx, 1, dst_rank);
+                    internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #endif
-#else
+                }
+#else  //USE_ROCM
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_flag + global_expert_idx, 1, dst_rank, local_expert_idx);
 #endif
             } else {
@@ -646,9 +672,13 @@ combine(void* combined_x,
 
     // Receiving phase
     LOW_LATENCY_COMBINE_RECV:
-    if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
+    if ((phases & LOW_LATENCY_RECV_PHASE) == 0){
+#if !defined(ROCM_DISABLE_CTX)
+        if constexpr (!multinode)
+            internode::shmem_wg_ctx_destroy(&ctx);
+#endif
         return;
-
+    }
     // Wait all ranks to arrive and notify PCIe usage
     if (responsible_expert_idx < num_experts) {
         // EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
@@ -701,7 +731,8 @@ combine(void* combined_x,
         }
     }
 #if !defined(ROCM_DISABLE_CTX)
-    internode::shmem_wg_ctx_destroy(&ctx);
+    if constexpr (!multinode)
+        internode::shmem_wg_ctx_destroy(&ctx);
 #endif
 }
 
