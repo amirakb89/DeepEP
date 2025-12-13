@@ -8,7 +8,7 @@
 #include <rocshmem/rocshmem.hpp>
 #include <iostream>
 // low latency+RocSHMEM has issue with CTX.
-#define ROCM_DISABLE_CTX
+//#define ROCM_DISABLE_CTX
 
 namespace cg = cooperative_groups;
 using namespace rocshmem;
@@ -348,9 +348,10 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
     // Receiving phase
     LOW_LATENCY_DISPATCH_RECV:
-    if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
+    if ((phases & LOW_LATENCY_RECV_PHASE) == 0){
+        internode::shmem_wg_ctx_destroy(&ctx);
         return;
-
+    }
     // For send-and-recv kernels, we need a grid sync for making `packed_recv_count` visible
     if (phases & LOW_LATENCY_SEND_PHASE){
         grid_barrier(global_atomic_counter, num_sms);
@@ -646,9 +647,10 @@ combine(void* combined_x,
 
     // Receiving phase
     LOW_LATENCY_COMBINE_RECV:
-    if ((phases & LOW_LATENCY_RECV_PHASE) == 0)
+    if ((phases & LOW_LATENCY_RECV_PHASE) == 0){
+        internode::shmem_wg_ctx_destroy(&ctx);
         return;
-
+    }
     // Wait all ranks to arrive and notify PCIe usage
     if (responsible_expert_idx < num_experts) {
         // EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
