@@ -519,7 +519,8 @@ combine(void* combined_x,
 
 #if !defined(ROCM_DISABLE_CTX)
     __shared__ internode::shmem_ctx_t ctx;
-    internode::shmem_wg_ctx_create(&ctx);
+    if constexpr(multinode)
+        internode::shmem_wg_ctx_create(&ctx);
 #endif
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
@@ -596,11 +597,15 @@ combine(void* combined_x,
                     UNROLLED_WARP_COPY(4, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
                 
                 //nvshmemi_ibgda_put_nbi_warp(dst_ptr, buf_ptr, hidden * sizeof(gpu_bfloat16_t), dst_rank, local_expert_idx, lane_id, token_idx - offset);
+                if constexpr (!multinode){
+                    internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
+                }else{
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmemx_int8_put_nbi_warp(reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
 #else
                     internode::shmem_ctx_schar_put_nbi_warp(ctx,reinterpret_cast<signed char*>(dst_ptr), reinterpret_cast<signed char*>(buf_ptr), hidden * sizeof(gpu_bfloat16_t), dst_rank);
 #endif
+                }
                 if constexpr (multinode){
 #if defined(ROCM_DISABLE_CTX)
                     internode::shmem_fence();
@@ -627,18 +632,18 @@ combine(void* combined_x,
 
             if (dst_rank != rank) {
 #ifdef USE_ROCM
-#if defined(ROCM_DISABLE_CTX)
-            if constexpr (multinode){
-                internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
-            }else{
-                rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
-            }
+                if constexpr (!multinode){
+                    rocshmem::rocshmem_long_p(rdma_recv_flag + global_expert_idx, 1, dst_rank);
+                } else {
+#if defined(ROCM_DISABLE_CTX)      
+                    internode::shmem_long_atomic_add(rdma_recv_flag + global_expert_idx, 1, dst_rank);
 #else
-                internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_flag + global_expert_idx, 1, dst_rank);
-#endif
+                    internode::shmem_ctx_long_atomic_add(ctx, rdma_recv_flag + global_expert_idx, 1, dst_rank);
+#endif //DISABLE_CTX
+                }
 #else
                 nvshmemi_ibgda_amo_nonfetch_add(rdma_recv_flag + global_expert_idx, 1, dst_rank, local_expert_idx);
-#endif
+#endif //USE_ROCM
             } else {
                 st_na_release(reinterpret_cast<int64_t*>(rdma_recv_flag + global_expert_idx), 1);
             }
@@ -657,7 +662,11 @@ combine(void* combined_x,
     // Receiving phase
     LOW_LATENCY_COMBINE_RECV:
     if ((phases & LOW_LATENCY_RECV_PHASE) == 0){
-        internode::shmem_wg_ctx_destroy(&ctx);
+#if !defined(ROCM_DISABLE_CTX)
+        if constexpr (multinode)
+            internode::shmem_wg_ctx_destroy(&ctx);
+#endif        
+
         return;
     }
     // Wait all ranks to arrive and notify PCIe usage
@@ -712,7 +721,8 @@ combine(void* combined_x,
         }
     }
 #if !defined(ROCM_DISABLE_CTX)
-    internode::shmem_wg_ctx_destroy(&ctx);
+    if constexpr (multinode)
+        internode::shmem_wg_ctx_destroy(&ctx);
 #endif
 }
 
