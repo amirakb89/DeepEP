@@ -1,9 +1,9 @@
-name: One-way Sync - Develop to Public Main
+name: "test-sync"
 
 on:
   push:
     branches:
-      - develop
+      - oneway-sync-workflows
   workflow_dispatch:
 
 permissions:
@@ -14,35 +14,44 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout deepEP_private develop branch
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ROCm
+          repositories: deepEP_private,DeepEP
+
+      - name: Checkout deepEP_private oneway-sync-workflows branch
         uses: actions/checkout@v4
         with:
           repository: ROCm/deepEP_private
-          ref: develop
-          token: ${{ secrets.SYNC_PAT_TOKEN }}
+          ref: oneway-sync-workflows
+          token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
 
       - name: Configure Git
         run: |
-          git config --global user.name "GitHub Action Bot"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "DeepEP-Sync-Bot[bot]"
+          git config --global user.email "DeepEP-Sync-Bot[bot]@users.noreply.github.com"
 
       - name: Add public DeepEP remote
         run: |
-          git remote add public-repo https://${{ secrets.SYNC_PAT_TOKEN }}@github.com/ROCm/DeepEP.git
-          git fetch public-repo main
+          git remote add public-repo https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/ROCm/DeepEP.git
+          git fetch public-repo test-main
 
       - name: Check sync status
         id: check_status
         run: |
-          DEVELOP_COMMIT=$(git rev-parse HEAD)
-          PUBLIC_MAIN_COMMIT=$(git rev-parse public-repo/main)
+          SOURCE_COMMIT=$(git rev-parse HEAD)
+          PUBLIC_TEST_MAIN_COMMIT=$(git rev-parse public-repo/test-main)
 
-          echo "Develop HEAD: $DEVELOP_COMMIT"
-          echo "Public main HEAD: $PUBLIC_MAIN_COMMIT"
+          echo "oneway-sync-workflows HEAD: $SOURCE_COMMIT"
+          echo "Public test-main HEAD: $PUBLIC_TEST_MAIN_COMMIT"
 
-          # Check if develop has commits not in public/main
-          COMMITS_AHEAD=$(git rev-list --count public-repo/main..HEAD)
+          # Check if oneway-sync-workflows has commits not in public/test-main
+          COMMITS_AHEAD=$(git rev-list --count public-repo/test-main..HEAD)
           echo "Commits ahead: $COMMITS_AHEAD"
 
           if [ "$COMMITS_AHEAD" -eq 0 ]; then
@@ -57,11 +66,11 @@ jobs:
         id: conflict_check
         if: steps.check_status.outputs.status == 'needs_sync'
         run: |
-          # Create a temporary branch from public/main
-          git checkout -b temp-main-sync public-repo/main
+          # Create a temporary branch from public/test-main
+          git checkout -b temp-test-main-sync public-repo/test-main
 
           # Attempt merge with --no-commit to check for conflicts
-          if git merge --no-commit --no-ff develop 2>/dev/null; then
+          if git merge --no-commit --no-ff oneway-sync-workflows 2>/dev/null; then
             echo "conflict=false" >> $GITHUB_OUTPUT
             echo "No conflicts detected"
             # Abort the test merge
@@ -73,19 +82,19 @@ jobs:
             exit 1
           fi
 
-      - name: Merge develop into main branch
+      - name: Merge oneway-sync-workflows into test-main branch
         if: steps.check_status.outputs.status == 'needs_sync' && steps.conflict_check.outputs.conflict == 'false'
         run: |
-          # Switch to main branch from public repo
-          git checkout -b main-sync public-repo/main
+          # Switch to test-main branch from public repo
+          git checkout -b test-main-sync public-repo/test-main
 
-          DEVELOP_COMMIT=$(git rev-parse develop)
+          SOURCE_COMMIT=$(git rev-parse oneway-sync-workflows)
 
-          # Merge develop into main
-          git merge develop -m "Sync: Merge from deepEP_private:develop to DeepEP:main
+          # Merge oneway-sync-workflows into test-main
+          git merge oneway-sync-workflows -m "Sync: Merge from deepEP_private:oneway-sync-workflows to DeepEP:test-main
 
-          Auto-sync via GitHub Actions
-          Source commit: $DEVELOP_COMMIT"
+          Auto-sync via GitHub Actions (TEST)
+          Source commit: $SOURCE_COMMIT"
 
       - name: Remove private .github folder
         if: steps.check_status.outputs.status == 'needs_sync' && steps.conflict_check.outputs.conflict == 'false'
@@ -102,8 +111,8 @@ jobs:
       - name: Push to public repository
         if: steps.check_status.outputs.status == 'needs_sync' && steps.conflict_check.outputs.conflict == 'false'
         run: |
-          git push public-repo main-sync:main
-          echo "Successfully synced develop to public DeepEP:main"
+          git push public-repo test-main-sync:test-main
+          echo "Successfully synced oneway-sync-workflows to public DeepEP:test-main"
 
       - name: Summary
         run: |
@@ -114,3 +123,4 @@ jobs:
           else
             echo "Sync completed successfully"
           fi
+
