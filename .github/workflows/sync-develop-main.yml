@@ -87,6 +87,18 @@ jobs:
           Auto-sync via GitHub Actions
           Source commit: $DEVELOP_COMMIT"
 
+      - name: Remove private .github folder
+        if: steps.check_status.outputs.status == 'needs_sync' && steps.conflict_check.outputs.conflict == 'false'
+        run: |
+          # Remove .github folder from the commit (it's private-repo specific)
+          if [ -d ".github" ]; then
+            git rm -rf .github
+            git commit --amend --no-edit
+            echo "Removed .github folder from sync"
+          else
+            echo ".github folder not present, skipping"
+          fi
+
       - name: Push to public repository
         if: steps.check_status.outputs.status == 'needs_sync' && steps.conflict_check.outputs.conflict == 'false'
         run: |
