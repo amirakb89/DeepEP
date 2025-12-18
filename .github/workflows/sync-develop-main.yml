@@ -14,22 +14,31 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ROCm
+          repositories: deepEP_private,DeepEP
+
       - name: Checkout deepEP_private develop branch
         uses: actions/checkout@v4
         with:
           repository: ROCm/deepEP_private
           ref: develop
-          token: ${{ secrets.SYNC_PAT_TOKEN }}
+          token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0
 
       - name: Configure Git
         run: |
-          git config --global user.name "GitHub Action Bot"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "DeepEP-Sync-Bot[bot]"
+          git config --global user.email "DeepEP-Sync-Bot[bot]@users.noreply.github.com"
 
       - name: Add public DeepEP remote
         run: |
-          git remote add public-repo https://${{ secrets.SYNC_PAT_TOKEN }}@github.com/ROCm/DeepEP.git
+          git remote add public-repo https://x-access-token:${{ steps.app-token.outputs.token }}@github.com/ROCm/DeepEP.git
           git fetch public-repo main
 
       - name: Check sync status
