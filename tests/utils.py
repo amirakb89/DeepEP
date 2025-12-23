@@ -10,7 +10,7 @@ def init_dist(local_rank: int, num_local_ranks: int, backend: str = 'nccl'):
     # NOTES: you may rewrite this function with your own cluster settings
     if backend == 'nccl':
         ip = os.getenv('MASTER_ADDR', '127.0.0.1')
-        port = int(os.getenv('MASTER_PORT', '8361'))
+        port = int(os.getenv('MASTER_PORT', '8365'))
         node_rank = int(os.getenv('RANK', 0))
     num_nodes = int(os.getenv('WORLD_SIZE', 1))
     assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
@@ -143,7 +143,7 @@ class suppress_stdout_stderr:
         self.errnull_file.close()
 
 
-def bench_kineto(fn, kernel_names, num_tests: int = 30, suppress_kineto_output: bool = False,
+def bench_kineto(fn, kernel_names, num_tests: int = 100, suppress_kineto_output: bool = False,
                  trace_path: Optional[str] = None, barrier_comm_profiling: bool = False):
     # Profile
     suppress = suppress_stdout_stderr if suppress_kineto_output else empty_suppress
