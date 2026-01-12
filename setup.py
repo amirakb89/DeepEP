@@ -22,6 +22,7 @@ if __name__ == "__main__":
     parser.add_argument("--enable_timer", action="store_true", help="Enable timer to debug time out in internode")
     parser.add_argument("--rocm-disable-ctx", action="store_true", help="Disable workgroup context optimization in internode")
     parser.add_argument("--disable-mpi", action="store_true", help="Disable MPI detection and configuration")
+    parser.add_argument("--nic", type=str, default="cx7", choices=["cx7", "thor2", "io"], help="Target NIC architecture (e.g., cx7, thor2)")
 
     # Get the arguments to be parsed and separate setuptools arguments
     args, unknown_args = parser.parse_known_args()
@@ -30,6 +31,7 @@ if __name__ == "__main__":
     rocm_disable_ctx = args.rocm_disable_ctx
     disable_mpi = args.disable_mpi
     enable_timer = args.enable_timer
+    nic_type = args.nic
 
     # Reset sys.argv for setuptools to avoid conflicts
     sys.argv = [sys.argv[0]] + unknown_args
@@ -112,7 +114,10 @@ if __name__ == "__main__":
         define_macros.append("-DENABLE_TIMER")
     if variant == "cuda" or rocm_disable_ctx:
         define_macros.append("-DROCM_DISABLE_CTX=1")
-
+    if nic_type:
+        nic_macro = f"-DNIC_{nic_type.upper()}=1"
+        define_macros.append(nic_macro)
+        print(f"Building with NIC Macro: {nic_macro}")
     cxx_flags = (
         [
             f"{optimization_flag}",
