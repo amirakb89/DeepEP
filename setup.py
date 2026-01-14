@@ -37,6 +37,8 @@ if __name__ == "__main__":
     sys.argv = [sys.argv[0]] + unknown_args
 
     print(f"Building for variant: {variant}")
+    if (nic_type == "cx7" and rocm_disable_ctx == False):
+        print("Warning: ctx is disabled for low latency and cx7!")
 
     if variant == "rocm":
         rocm_path = os.getenv("ROCM_HOME", "/opt/rocm")
