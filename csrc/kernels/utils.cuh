@@ -233,7 +233,7 @@ __device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t *ptr) {
 #endif
     return ret;
 }
-__device__ __forceinline__ uint64_t ld_acquire_sys_global(const int64_t *ptr) {
+__device__ __forceinline__ int64_t ld_acquire_sys_global(const int64_t *ptr) {
     int64_t ret;
 #ifdef USE_ROCM
     ret = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
