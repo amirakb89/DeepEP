@@ -99,7 +99,7 @@ def test_main(args: argparse.Namespace,
     time.sleep(1)
 
     # Config
-    rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (24, 48, 96, 144, 160) else 512)
+    rdma_buffer_size, nvl_buffer_size = 512, (720 if num_ranks in (24, 48, 96, 144, 160) else 512)
     config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
 
     # Test dispatch
@@ -201,7 +201,7 @@ def test_main(args: argparse.Namespace,
 
                     hash_value += hash_tensor(recv_x)
 
-                    # For later tuning
+                    # # For later tuning
                     dispatch_bf16_rdma_send_bytes = num_rdma_token_sent * hidden * 2
                     dispatch_bf16_nvl_recv_bytes = recv_x.numel() * 2
                     combine_bf16_nvl_send_bytes = dispatch_bf16_nvl_recv_bytes
@@ -302,7 +302,7 @@ def test_loop(local_rank: int, num_local_ranks: int, args: argparse.Namespace):
     if args.test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
-    num_sms = 24
+    num_sms = 64
     num_qps_per_rank = max(num_sms, ll_num_experts // num_ranks if args.test_ll_compatibility else 0)
 
     buffer = deep_ep.Buffer(group,
