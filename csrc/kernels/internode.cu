@@ -174,12 +174,12 @@ int get_source_meta_bytes() {
 }
 
 __host__ __device__ __forceinline__
-int get_num_bytes_per_rdma_token(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
+int64_t get_num_bytes_per_rdma_token(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights) {
     return static_cast<int>(align(hidden_int4 * sizeof(int4) + sizeof(SourceMeta) + num_scales * sizeof(float) + num_topk_idx * sizeof(int) + num_topk_weights * sizeof(float), sizeof(int4)));
 }
 
 __host__ __device__ __forceinline__
-std::pair<int, int> get_rdma_clean_meta(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights, int num_rdma_ranks, int num_rdma_recv_buffer_tokens, int num_sms) {
+std::pair<int64_t, int64_t> get_rdma_clean_meta(int hidden_int4, int num_scales, int num_topk_idx, int num_topk_weights, int num_rdma_ranks, int num_rdma_recv_buffer_tokens, int num_sms) {
     // Return `int32_t` offset and count to clean
     return {
         (get_num_bytes_per_rdma_token(hidden_int4, num_scales, num_topk_idx, num_topk_weights) * num_rdma_recv_buffer_tokens * num_rdma_ranks * 2 * num_sms) / sizeof(int),
@@ -485,11 +485,20 @@ void notify_dispatch(const int* num_tokens_per_rank,
 
     // Get clean meta
     auto rdma_clean_meta = get_rdma_clean_meta(hidden_int4, num_scales, num_topk, num_topk, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
+    //printf(" first %lld, second %lld, num_rdma_bytes %lld \n ", rdma_clean_meta.first, rdma_clean_meta.second, num_rdma_bytes);
+
     auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4, num_scales, num_topk, num_topk, num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens, num_channels);
-    EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= num_rdma_bytes);
-    EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
-    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
+    
+
+    EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= static_cast<size_t>(num_rdma_bytes));
+    EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= static_cast<size_t>(num_nvl_bytes));
+#ifdef USE_ROCM
+    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int64_t>::max());
     EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int64_t>::max());
+#else
+    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
+#endif
 
     // Launch kernel
     SETUP_LAUNCH_CONFIG(1 + num_rdma_ranks, kNumThreads, stream);
@@ -1405,10 +1414,15 @@ void cached_notify(int hidden_int4,
     // Get clean meta
     auto rdma_clean_meta = get_rdma_clean_meta(hidden_int4, num_scales, num_topk_idx, num_topk_weights, num_rdma_ranks, num_max_rdma_chunked_recv_tokens, num_channels);
     auto nvl_clean_meta = get_nvl_clean_meta(hidden_int4, num_scales, num_topk_idx, num_topk_weights, num_rdma_ranks, NUM_MAX_NVL_PEERS, num_max_nvl_chunked_recv_tokens, num_channels);
-    EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= num_rdma_bytes);
-    EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= num_nvl_bytes);
+    EP_HOST_ASSERT((rdma_clean_meta.first + rdma_clean_meta.second) * sizeof(int) <= static_cast<size_t>(num_rdma_bytes));
+    EP_HOST_ASSERT((nvl_clean_meta.first + nvl_clean_meta.second) * sizeof(int) <= static_cast<size_t>(num_nvl_bytes));
+#ifdef USE_ROCM
     EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int64_t>::max());
     EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int64_t>::max());
+#else
+    EP_HOST_ASSERT(num_rdma_bytes < std::numeric_limits<int>::max());
+    EP_HOST_ASSERT(num_nvl_bytes < std::numeric_limits<int>::max());
+#endif
     EP_HOST_ASSERT(num_channels * 2 > 3);
 
     // Launch kernel
