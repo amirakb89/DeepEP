@@ -1319,13 +1319,12 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
 
         // Iterate in reverse order
 #ifdef USE_ROCM
-        int remain_warp_id = warp_id;
-        for (int i = 0; i < num_channels; i += num_warps) {
-            warp_id = i * num_warps + remain_warp_id;
+        for (int channel_id = 0; channel_id < num_channels; channel_id += num_warps) {
+            int kwarp_id = channel_id + warp_id;
 #endif
-        if (lane_id < num_rdma_ranks and warp_id < num_channels) {
+        if (lane_id < num_rdma_ranks and kwarp_id < num_channels) {
             int token_start_idx, token_end_idx;
-            get_channel_task_range(num_combined_tokens, num_channels, warp_id, token_start_idx, token_end_idx);
+            get_channel_task_range(num_combined_tokens, num_channels, kwarp_id, token_start_idx, token_end_idx);
 
             // NOTES: `1 << 25` is a heuristic large number
             int last_head = 1 << 25;
@@ -1350,15 +1349,14 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
         EP_DEVICE_ASSERT(rdma_channel_prefix_matrix != nullptr and rdma_rank_prefix_sum != nullptr);
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= kWarpSize, "Too many NVL peers");
 #ifdef USE_ROCM
-        int remain_warp_id = warp_id;
-        for (int i = 0; i < num_channels; i += num_warps) {
-            warp_id = i * num_warps + remain_warp_id;
+        for (int channel_id = 0; channel_id < num_channels; channel_id += num_warps) {
+            int kwarp_id = channel_id + warp_id;
 #endif
-            if (lane_id < NUM_MAX_NVL_PEERS and warp_id < num_channels) {
+            if (lane_id < NUM_MAX_NVL_PEERS and kwarp_id < num_channels) {
                 for (int dst_rdma_rank = sm_id - 3; dst_rdma_rank < num_rdma_ranks; dst_rdma_rank += num_channels * 2 - 3) {
                     // Iterate in reverse order
-                    int token_start_idx = warp_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id - 1];
-                    int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + warp_id];
+                    int token_start_idx = kwarp_id == 0 ? 0 : rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + kwarp_id - 1];
+                    int token_end_idx = rdma_channel_prefix_matrix[dst_rdma_rank * num_channels + kwarp_id];
                     int shift = dst_rdma_rank == 0 ? 0 : rdma_rank_prefix_sum[dst_rdma_rank - 1];
                     token_start_idx += shift, token_end_idx += shift;
 
