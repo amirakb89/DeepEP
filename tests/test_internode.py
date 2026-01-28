@@ -82,7 +82,7 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
     time.sleep(1)
 
     # Config
-    rdma_buffer_size, nvl_buffer_size = 128, (720 if num_ranks in (144, 160) else 512)
+    rdma_buffer_size, nvl_buffer_size = 512, (720 if num_ranks in (144, 160) else 512)
     config = deep_ep.Config(num_sms, 8, nvl_buffer_size, 16, rdma_buffer_size)
 
     # Test dispatch
@@ -227,13 +227,29 @@ def test_loop(local_rank: int, num_local_ranks: int, backend: str):
     if test_ll_compatibility:
         ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
-    buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
+    buffer = deep_ep.Buffer(group, int(2e9), int(2e9), low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1))
     assert num_local_ranks == 8 and num_ranks > 8
     torch.manual_seed(rank)
 
-    for i in (32, ):
-        test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
+    IS_HIP = hasattr(torch.version, 'hip') and torch.version.hip is not None
+
+    num_sms = 24
+    if (IS_HIP):
+        if num_nodes < 8:
+            num_sms = 64
+        else:
+            num_sms = 32
+    test_main(num_sms, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
+    if local_rank == 0:
+        print()
+
+    do_pressure_test = True
+    for seed in range(int(1e9) if do_pressure_test else 0):
+        if local_rank == 0:
+            print(f'Testing with seed {seed} ...', flush=True)
+
+        test_main(num_sms, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
         if local_rank == 0:
             print()
 
