@@ -31,30 +31,51 @@ DeepEP (AMD version) depends on [rocSHMEM](https://github.com/ROCm/rocSHMEM). Pl
 git clone https://github.com/ROCm/DeepEP
 cd DeepEP
 
+## Network configurations
+
+DeepEP (AMD) currently supports the following NIC families (selected via --nic):
+
+cx7   : NVIDIA/Mellanox ConnectX (mlx5 driver) — e.g., mlx5_0, mlx5_1
+thor2 : Broadcom / Thor2 RDMA (bnxt_re driver) — e.g., bnxt_re0 ... bnxt_re7
+io    : AMD Pensando AI NIC
+
+Tip: use cx7 if you see mlx5_* under /sys/class/infiniband, and thor2 if you see bnxt_re*.
+
+You can confirm your NIC driver names via:
+ibdev2netdev
+ls /sys/class/infiniband
+
+
+# To use DeepEP without MPI, please make sure rocSHMEM was built with this flag -DUSE_EXTERNAL_MPI=OFF
+# Pass the NIC_TYPE, which can be one of: cx7, thor2, io. The default is cx7.
+# Then install DeepEP using this command
+python3 setup.py --variant rocm --nic <NIC_TYPE> build develop --user
 
 # To use DeepEP with MPI, please proceed with these commands
 # Export OMPI dir in the next command (e.g., it's $BUILD_DIR/ompi in third-party/README.md)
 export OMPI_DIR=<ompi_dir>
-python3 setup.py --variant rocm build develop --user
-
-# To use DeepEP without MPI, please make sure rocSHMEM was built with this flag -DUSE_EXTERNAL_MPI=OFF
+# Pass the NIC_TYPE, which can be one of: cx7, thor2, io. The default is cx7.
 # Then install DeepEP using this command
-python3 setup.py --variant rocm --disable-mpi build develop --user
+python3 setup.py --variant rocm --enable-mpi --nic <NIC_TYPE> build develop --user
 
 # Run test cases
 # NOTES: you may modify the `init_dist` function in `tests/utils.py`
 # according to your own cluster settings, and launch into multiple nodes
 python3 tests/test_intranode.py
+# set the requiered ROCSHMEM number of contexts.
+export ROCSHMEM_MAX_NUM_CONTEXTS=64
 python3 tests/test_internode.py
 # Set the required ROCSHMEM heap size (for example, for DeepSeek models) 
 export ROCSHMEM_HEAP_SIZE=2147483648
+# set the requiered ROCSHMEM number of contexts.
+export ROCSHMEM_MAX_NUM_CONTEXTS=144
 python3 tests/test_low_latency.py
 ```
 
 ### Installation
 
 ```bash
-python3 setup.py --variant rocm build develop
+python3 setup.py --variant rocm --nic  build develop
 ```
 
 Then, import `deep_ep` in your Python project, and enjoy!
