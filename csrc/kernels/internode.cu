@@ -1246,7 +1246,9 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
         EP_DEVICE_ASSERT(num_rdma_ranks <= kWarpSize);
 
         // Iterate in reverse order
-#ifdef USE_ROCM
+#ifndef USE_ROCM
+        int kwarp_id = warp_id;
+#else
         for (int channel_id = 0; channel_id < num_channels; channel_id += num_warps) {
             int kwarp_id = channel_id + warp_id;
 #endif
@@ -1276,7 +1278,9 @@ __global__ void cached_notify(const int rdma_clean_offset, const int rdma_num_in
 #endif
         EP_DEVICE_ASSERT(rdma_channel_prefix_matrix != nullptr and rdma_rank_prefix_sum != nullptr);
         EP_STATIC_ASSERT(NUM_MAX_NVL_PEERS <= kWarpSize, "Too many NVL peers");
-#ifdef USE_ROCM
+#ifndef USE_ROCM
+        int kwarp_id = warp_id;
+#else
         for (int channel_id = 0; channel_id < num_channels; channel_id += num_warps) {
             int kwarp_id = channel_id + warp_id;
 #endif

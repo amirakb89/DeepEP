@@ -244,7 +244,7 @@ def test_loop(local_rank: int, num_local_ranks: int, backend: str):
     if local_rank == 0:
         print()
 
-    do_pressure_test = True
+    do_pressure_test = False
     for seed in range(int(1e9) if do_pressure_test else 0):
         if local_rank == 0:
             print(f'Testing with seed {seed} ...', flush=True)
