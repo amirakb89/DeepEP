@@ -1013,8 +1013,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                  barrier_signal_ptrs_gpu,
                                  rank,
                                  comm_stream,
-                                 num_rdma_bytes,
-                                 num_nvl_bytes,
+                                 config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+				 num_nvl_bytes,
                                  true,
                                  low_latency_mode);
         move_fifo_slots(2);
@@ -1054,8 +1054,8 @@ Buffer::internode_dispatch(const torch::Tensor& x,
                                    barrier_signal_ptrs_gpu,
                                    rank,
                                    comm_stream,
-                                   num_rdma_bytes,
-                                   num_nvl_bytes,
+                                   config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+				   num_nvl_bytes,
                                    low_latency_mode);
         move_fifo_slots(3);
 
@@ -1324,8 +1324,8 @@ std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandl
                              barrier_signal_ptrs_gpu,
                              rank,
                              comm_stream,
-                             num_rdma_bytes,
-                             num_nvl_bytes,
+                             config.get_rdma_buffer_size_hint(hidden_int4 * sizeof(int4), num_ranks),
+			     num_nvl_bytes,
                              false,
                              low_latency_mode);
     move_fifo_slots(2);
