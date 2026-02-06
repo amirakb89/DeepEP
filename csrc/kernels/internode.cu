@@ -897,7 +897,7 @@ asm volatile(
                 src_rdma_rank = (src_rdma_rank + 1) % kNumRDMARanks;
                 if (shfl_sync(num_tokens_to_recv_from_rdma, src_rdma_rank) > 0) {
                     if (lane_id == src_rdma_rank and cached_rdma_channel_head == cached_rdma_channel_tail)
-                        cached_rdma_channel_tail = static_cast<int>(ld_relaxed_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
+                        cached_rdma_channel_tail = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(src_rdma_rank)));
                     if (shfl_sync(cached_rdma_channel_tail > cached_rdma_channel_head, src_rdma_rank))
                         break;
                 }
@@ -1909,7 +1909,7 @@ combine(int4* combined_x, float* combined_topk_weights,
                 auto start_time = wall_clock64();
 #endif
                 while (cached_channel_tail_idx <= expected_head) {
-                    cached_channel_tail_idx = static_cast<int>(ld_relaxed_sys_global(rdma_channel_tail.buffer(lane_id)));
+                    cached_channel_tail_idx = static_cast<int>(ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
 
                     // Timeout check
 #ifdef ENABLE_TIMER

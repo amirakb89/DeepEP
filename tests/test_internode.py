@@ -230,7 +230,6 @@ def test_loop(local_rank: int, num_local_ranks: int, backend: str):
     buffer = deep_ep.Buffer(group, int(2e9), int(2e9), low_latency_mode=test_ll_compatibility,
                             num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1))
     assert num_local_ranks == 8 and num_ranks > 8
-    torch.manual_seed(rank)
 
     IS_HIP = hasattr(torch.version, 'hip') and torch.version.hip is not None
 
@@ -249,7 +248,9 @@ def test_loop(local_rank: int, num_local_ranks: int, backend: str):
         if local_rank == 0:
             print(f'Testing with seed {seed} ...', flush=True)
 
-        test_main(num_sms, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
+        torch.manual_seed(rank + seed)
+
+        test_main(num_sms, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group,)
         if local_rank == 0:
             print()
 
