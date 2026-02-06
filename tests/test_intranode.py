@@ -1,4 +1,5 @@
 import os
+import argparse
 import time
 import torch
 import torch.distributed as dist
@@ -199,26 +200,64 @@ def test_main(num_sms: int, local_rank: int, num_ranks: int, rank: int, buffer: 
 def test_loop(local_rank: int, num_local_ranks: int):
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     test_ll_compatibility, num_rdma_bytes = False, 0
-    if test_ll_compatibility:
-        ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
-        num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(ll_num_tokens, ll_hidden, num_ranks, ll_num_experts)
 
-    buffer = deep_ep.Buffer(group, int(1e9), num_rdma_bytes, low_latency_mode=test_ll_compatibility,
-                            num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1))
-    torch.manual_seed(rank)
+    buffer = None
+    try:
+        if test_ll_compatibility:
+            ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
+            num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(
+                ll_num_tokens, ll_hidden, num_ranks, ll_num_experts
+            )
 
-    for i in (64, ):
-        test_main(i, local_rank, num_ranks, rank, buffer, group)
-        if local_rank == 0:
-            print()
+        buffer = deep_ep.Buffer(
+            group, int(1e9), num_rdma_bytes,
+            low_latency_mode=test_ll_compatibility,
+            num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1)
+        )
+        torch.manual_seed(rank)
 
-    # Test compatibility with low latency functions
-    if test_ll_compatibility:
-        buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
-        test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
+        for i in (64,):
+            test_main(i, local_rank, num_ranks, rank, buffer, group)
+            if local_rank == 0:
+                print(flush=True)
 
-    dist.destroy_process_group(group)
+        if test_ll_compatibility:
+            buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
+            test_low_latency.test_main(
+                ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk,
+                rank, num_ranks, group, buffer, seed=1
+            )
 
-if __name__ == '__main__':
-    num_processes = 8
-    torch.multiprocessing.spawn(test_loop, args=(num_processes, ), nprocs=num_processes)
+        # Ensure all ranks finish work before teardown
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+
+    finally:
+        # Best-effort cleanup (prevents ProcessGroup/TCPStore warnings)
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            dist.barrier(group=group)
+        except Exception:
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--launcher", choices=["spawn", "torchrun"], default="spawn")
+    parser.add_argument("--nproc", type=int, default=8)
+    args = parser.parse_args()
+
+    if args.launcher == "torchrun":
+        # torchrun already created one process per GPU
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(args.nproc)))
+        test_loop(local_rank, local_world_size)
+    else:
+        num_processes = 8
+        torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)

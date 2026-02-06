@@ -1,7 +1,9 @@
+import argparse
 import random
 import torch
 import torch.distributed as dist
 from functools import partial
+import os
 
 import deep_ep
 from utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
@@ -155,23 +157,49 @@ def test_loop(local_rank: int, num_local_ranks: int):
     # The default setting of deepEP upstream is below: 
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
-    num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
-    if local_rank == 0:
-        print(f'Allocating buffer size: {num_rdma_bytes / 1e6} MB ...', flush=True)
-    buffer = deep_ep.Buffer(group, num_rdma_bytes=num_rdma_bytes, low_latency_mode=True,
-                            num_qps_per_rank=num_experts // num_ranks)
-    test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=1)
-
-    do_pressure_test = False
-    for seed in range(int(1e9) if do_pressure_test else 0):
+    try:
+        num_rdma_bytes = deep_ep.Buffer.get_low_latency_rdma_size_hint(num_tokens, hidden, num_ranks, num_experts)
         if local_rank == 0:
-            print(f'Testing with seed {seed} ...', flush=True)
-        ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed)
-        for i in range(20):
-            assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
+            print(f'Allocating buffer size: {num_rdma_bytes / 1e6} MB ...', flush=True)
+        buffer = deep_ep.Buffer(group, num_rdma_bytes=num_rdma_bytes, low_latency_mode=True,
+                                num_qps_per_rank=num_experts // num_ranks)
+        test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=1)
 
+        do_pressure_test = False
+        for seed in range(int(1e9) if do_pressure_test else 0):
+            if local_rank == 0:
+                print(f'Testing with seed {seed} ...', flush=True)
+            ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed)
+            for i in range(20):
+                assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
 
-if __name__ == '__main__':
-    # TODO: you may modify NUMA binding for less CPU overhead
-    num_processes = 8
-    torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+    finally:
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            dist.barrier()
+        except Exception:
+            pass
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--launcher", choices=["spawn", "torchrun"], default="spawn")
+    parser.add_argument("--nproc", type=int, default=8)
+    args = parser.parse_args()
+
+    if args.launcher == "torchrun":
+        # torchrun already created one process per GPU
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(args.nproc)))
+        test_loop(local_rank, local_world_size)
+    else:
+        num_processes = 8
+        torch.multiprocessing.spawn(test_loop, args=(num_processes,), nprocs=num_processes)

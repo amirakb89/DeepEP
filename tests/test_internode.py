@@ -1,4 +1,5 @@
 import os
+import argparse
 import time
 import torch
 import torch.distributed as dist
@@ -9,7 +10,7 @@ from utils import init_dist, bench, calc_diff, create_grouped_scores, inplace_un
 
 # Test compatibility with low latency functions
 import test_low_latency
-import argparse
+
 
 
 def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: int, num_nodes: int, rank: int, buffer: deep_ep.Buffer, group: dist.ProcessGroup):
@@ -221,38 +222,79 @@ def test_main(num_sms: int, local_rank: int, num_local_ranks: int, num_ranks: in
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int, backend: str):
-    num_nodes = int(os.getenv('WORLD_SIZE', 2))
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks, backend=backend)
-    test_ll_compatibility = False
-    if test_ll_compatibility:
-        ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
-    buffer = deep_ep.Buffer(group, int(1e9), int(1e9), low_latency_mode=test_ll_compatibility,
-                            num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1))
-    assert num_local_ranks == 8 and num_ranks > 8
-    torch.manual_seed(rank)
+    # WORLD_SIZE under torchrun is total ranks; derive num_nodes correctly
+    assert num_ranks % num_local_ranks == 0
+    num_nodes = num_ranks // num_local_ranks
 
-    for i in (32, ):
-        test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
-        if local_rank == 0:
-            print()
+    buffer = None
+    try:
+        test_ll_compatibility = False
+        if test_ll_compatibility:
+            ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk = 16, 5120, 256, 9
 
-    # Test compatibility with low latency functions
-    if test_ll_compatibility:
-        buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
-        test_low_latency.test_main(ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk, rank, num_ranks, group, buffer, seed=1)
+        buffer = deep_ep.Buffer(
+            group, int(1e9), int(1e9),
+            low_latency_mode=test_ll_compatibility,
+            num_qps_per_rank=(ll_num_experts // num_ranks if test_ll_compatibility else 1)
+        )
 
+        assert num_local_ranks == 8 and num_ranks > 8
+        torch.manual_seed(rank)
+
+        for i in (32,):
+            test_main(i, local_rank, num_local_ranks, num_ranks, num_nodes, rank, buffer, group)
+            if local_rank == 0:
+                print(flush=True)
+
+        if test_ll_compatibility:
+            buffer.clean_low_latency_buffer(ll_num_tokens, ll_hidden, ll_num_experts)
+            test_low_latency.test_main(
+                ll_num_tokens, ll_hidden, ll_num_experts, ll_num_topk,
+                rank, num_ranks, group, buffer, seed=1
+            )
+
+        # Make sure all ranks finish before teardown
+        torch.cuda.synchronize()
+        dist.barrier(group=group)
+
+    finally:
+        # Best-effort cleanup to stop heartbeat threads before rank0 store dies
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        try:
+            if dist.is_initialized():
+                dist.barrier(group=group)
+        except Exception:
+            pass
+        try:
+            if dist.is_initialized():
+                dist.destroy_process_group()
+        except Exception:
+            pass
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Test internode communication')
     parser.add_argument('--backend', type=str, choices=['mpi', 'nccl'], default='nccl',
                         help='Backend for distributed communication (mpi or nccl)')
+    parser.add_argument("--launcher", choices=["spawn", "torchrun"], default="spawn")
+    parser.add_argument("--nproc", type=int, default=8)
     args = parser.parse_args()
-    num_processes = 8
-    if args.backend == 'mpi':
-        dist.init_process_group(backend='mpi')
-        rank = dist.get_rank()
-        local_rank = rank % num_processes
-        test_loop(local_rank=local_rank, num_local_ranks=num_processes, backend='mpi')
+
+    if args.launcher == "torchrun":
+        # torchrun already created one process per GPU
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(args.nproc)))
+        test_loop(local_rank, local_world_size, backend='nccl')
     else:
-        torch.multiprocessing.spawn(test_loop, args=(num_processes, 'nccl'), nprocs=num_processes)
+        num_processes = 8
+        if args.backend == 'mpi':
+            dist.init_process_group(backend='mpi')
+            rank = dist.get_rank()
+            local_rank = rank % num_processes
+            test_loop(local_rank=local_rank, num_local_ranks=num_processes, backend='mpi')
+        else:
+            torch.multiprocessing.spawn(test_loop, args=(num_processes, 'nccl'), nprocs=num_processes)

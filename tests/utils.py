@@ -6,27 +6,56 @@ import torch.distributed as dist
 from typing import Optional
 
 
-def init_dist(local_rank: int, num_local_ranks: int, backend: str = 'nccl'):
-    # NOTES: you may rewrite this function with your own cluster settings
-    if backend == 'nccl':
-        ip = os.getenv('MASTER_ADDR', '127.0.0.1')
-        port = int(os.getenv('MASTER_PORT', '8361'))
-        node_rank = int(os.getenv('RANK', 0))
-    num_nodes = int(os.getenv('WORLD_SIZE', 1))
-    assert (num_local_ranks < 8 and num_nodes == 1) or num_local_ranks == 8
-    if backend == 'nccl':
-        dist.init_process_group(
-            backend='nccl',
-            init_method=f'tcp://{ip}:{port}',
-            world_size=num_nodes * num_local_ranks,
-            rank=node_rank * num_local_ranks + local_rank
-        )
+def init_dist(local_rank: int | None = None,
+              local_world_size: int | None = None,
+              backend: str = "nccl"):
+    # Env provided by torchrun
+    rank             = int(os.environ.get("RANK", "0"))             # global rank
+    world_size       = int(os.environ.get("WORLD_SIZE", "1"))       # global world size
+    env_local_rank   = os.environ.get("LOCAL_RANK", None)           # GPU index on this node (string or None)
+    env_lws          = int(os.environ.get("LOCAL_WORLD_SIZE", "1"))
+    node_rank        = int(os.environ.get("NODE_RANK", str(rank // max(1, env_lws))))
+
+    master_addr = os.environ.get("MASTER_ADDR", "127.0.0.1")
+    master_port = os.environ.get("MASTER_PORT", "29500")
+
+    # Decide which local_rank to use:
+    # - torchrun: LOCAL_RANK is present
+    # - python+spawn: use function argument
+    if env_local_rank is not None:
+        local_rank = int(env_local_rank)
+        local_world_size = env_lws
+    else:
+        assert local_rank is not None and local_world_size is not None, \
+            "python+spawn requires init_dist(local_rank, local_world_size)"
+        # Keep your spawn-style multi-node convention if you set it:
+        # RANK = node_rank, WORLD_SIZE = num_nodes
+        node_rank = int(os.environ.get("RANK", "0"))
+        num_nodes = int(os.environ.get("WORLD_SIZE", "1"))
+        rank = node_rank * int(local_world_size) + int(local_rank)
+        world_size = int(num_nodes) * int(local_world_size)
+
+    torch.cuda.set_device(int(local_rank))
+
+    dist.init_process_group(
+        backend=backend,
+        init_method=f"tcp://{master_addr}:{master_port}",
+        rank=int(rank),
+        world_size=int(world_size),
+        device_id=int(local_rank),  # mutes barrier warning
+    )
+
     torch.set_default_dtype(torch.bfloat16)
-    torch.set_default_device('cuda')
-    torch.cuda.set_device(local_rank)
+    torch.set_default_device("cuda")
 
-    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes)))
+    # Global group (all ranks)
+    world_group = dist.group.WORLD
 
+    # Optional per-node group (kept; not returned)
+    base = int(node_rank) * int(local_world_size)
+    _node_group = dist.new_group(list(range(base, base + int(local_world_size))))
+
+    return int(rank), int(world_size), world_group
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):
     x, y = x.double() + 1, y.double() + 1
