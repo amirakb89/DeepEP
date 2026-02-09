@@ -21,7 +21,7 @@ if __name__ == "__main__":
     parser.add_argument("--verbose", action="store_true", help="Verbose build")
     parser.add_argument("--enable_timer", action="store_true", help="Enable timer to debug time out in internode")
     parser.add_argument("--rocm-disable-ctx", action="store_true", help="Disable workgroup context optimization in internode")
-    parser.add_argument("--disable-mpi", action="store_true", help="Disable MPI detection and configuration")
+    parser.add_argument("--enable-mpi", action="store_true", help="Enable MPI detection and configuration")
     parser.add_argument("--nic", type=str, default="cx7", choices=["cx7", "thor2", "io"], help="Target NIC architecture (e.g., cx7, thor2)")
 
     # Get the arguments to be parsed and separate setuptools arguments
@@ -29,7 +29,7 @@ if __name__ == "__main__":
     variant = args.variant
     debug = args.debug
     rocm_disable_ctx = args.rocm_disable_ctx
-    disable_mpi = args.disable_mpi
+    enable_mpi = args.enable_mpi
     enable_timer = args.enable_timer
     nic_type = args.nic
 
@@ -61,7 +61,7 @@ if __name__ == "__main__":
     print(f"{shmem_variant_name} directory: {shmem_dir}")
 
     ompi_dir = None
-    if variant == "rocm" and not disable_mpi:
+    if variant == "rocm" and enable_mpi:
         # Attempt to auto-detect OpenMPI installation directory if OMPI_DIR not set.
         # The first existing candidate containing bin/mpicc will be used.
         print("MPI detection enabled for ROCm variant")
@@ -89,9 +89,9 @@ if __name__ == "__main__":
             f"Set OMPI_DIR environment variable or use --disable-mpi flag."
         )
         print(f"Detected OpenMPI directory: {ompi_dir}")
-    elif variant == "rocm" and disable_mpi:
+    elif variant == "rocm" and not enable_mpi:
         print("MPI detection disabled for ROCm variant")
-    elif variant == "cuda" and not disable_mpi:
+    elif variant == "cuda" and enable_mpi:
         print("MPI detection enabled for CUDA variant")
     else:
         print("MPI detection disabled for CUDA variant")
@@ -181,7 +181,7 @@ if __name__ == "__main__":
                 "-libverbs",
             ]
         )
-        if not disable_mpi:
+        if enable_mpi:
             extra_link_args.extend(
                 [
                     f"-l:libmpi.so",
