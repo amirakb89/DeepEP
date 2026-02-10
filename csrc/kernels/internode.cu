@@ -1869,7 +1869,7 @@ combine(int4* combined_x, float* combined_topk_weights,
             // Move queue tail
             syncwarp();
             if (lane_id < kNumRDMARanks and is_lane_ready)
-                st_release_sys_global(nvl_channel_tail.buffer() + lane_id,
+                st_relaxed_sys_global(nvl_channel_tail.buffer() + lane_id,
                                     cached_channel_tail_idx);
         }
     }else {
@@ -2034,7 +2034,7 @@ combine(int4* combined_x, float* combined_topk_weights,
           // num_chunked_tokens` Here, `token_start_idx` is the actual tail
           int num_used_slots =
               token_start_idx -
-              ld_acquire_sys_global(rdma_channel_head.buffer(dst_rdma_rank));
+              ld_relaxed_sys_global(rdma_channel_head.buffer(dst_rdma_rank));
           if (num_max_rdma_chunked_recv_tokens - num_used_slots >=
               num_chunked_tokens)
             break;
@@ -2078,7 +2078,7 @@ combine(int4* combined_x, float* combined_topk_weights,
           start_time = clock64();
           while (cached_nvl_channel_tail_idx <= expected_head) {
             cached_nvl_channel_tail_idx =
-                ld_acquire_sys_global(nvl_channel_tail.buffer(lane_id));
+                ld_relaxed_sys_global(nvl_channel_tail.buffer(lane_id));
 
             // Timeout check
             // if (clock64() - start_time > NUM_TIMEOUT_CYCLES and
@@ -2297,7 +2297,7 @@ combine(int4* combined_x, float* combined_topk_weights,
         auto start_time = clock64();
         while (cached_channel_tail_idx <= expected_head) {
           cached_channel_tail_idx = static_cast<int>(
-              ld_acquire_sys_global(rdma_channel_tail.buffer(lane_id)));
+              ld_relaxed_sys_global(rdma_channel_tail.buffer(lane_id)));
 
           // Timeout check
         //   if (clock64() - start_time > NUM_TIMEOUT_CYCLES) {
