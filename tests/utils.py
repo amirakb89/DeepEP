@@ -178,7 +178,7 @@ class suppress_stdout_stderr:
 
 def bench_kineto(fn,
                  kernel_names: Union[str, tuple],
-                 num_tests: int = 30,
+                 num_tests: int = 100,
                  suppress_kineto_output: bool = False,
                  trace_path: Optional[str] = None,
                  barrier_comm_profiling: bool = False,

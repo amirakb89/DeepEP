@@ -17,18 +17,18 @@ namespace deep_ep {
 namespace internode_ll {
 
 __device__ void grid_barrier(int* global_counter, int num_blocks) {
-volatile int ret;
+    volatile int ret;
     __syncthreads();
-    __threadfence();
     if (threadIdx.x == 0 ) {
-        ret = __hip_atomic_fetch_add( &global_counter[0], 1,
-                            __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __threadfence();
+	    ret = __hip_atomic_fetch_add( &global_counter[0], 1,
+                __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-            while (__hip_atomic_load(global_counter,
-                                     __ATOMIC_RELAXED,
-                                     __HIP_MEMORY_SCOPE_AGENT) != num_blocks);
+        while (__hip_atomic_load(global_counter,
+                 __ATOMIC_RELAXED,
+                 __HIP_MEMORY_SCOPE_AGENT) != num_blocks);
     }
     __syncthreads();
 }
@@ -486,7 +486,7 @@ void dispatch(void* packed_recv_x,
               int num_device_sms,
               cudaStream_t stream,
               int phases,
-              int* global_atomic_counter = NULL) {
+              int* global_atomic_counter) {
 
 #ifdef USE_ROCM
     constexpr int kNumWarpsPerGroup = 8;
@@ -508,12 +508,12 @@ void dispatch(void* packed_recv_x,
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
 
     // Preserve legacy host signature parameters while adopting the new kernel launch.
-    (void)mask_buffer_ptr;
-    (void)cumulative_local_expert_recv_stats;
-    (void)dispatch_wait_recv_cost_stats;
-    (void)round_scale;
-    (void)use_ue8m0;
-    (void)num_device_sms;
+    // (void)mask_buffer_ptr;
+    // (void)cumulative_local_expert_recv_stats;
+    // (void)dispatch_wait_recv_cost_stats;
+    // (void)round_scale;
+    // (void)use_ue8m0;
+    // (void)num_device_sms;
 
     static_assert(sizeof(topk_idx_t) == sizeof(int64_t),
                   "internode_ll::dispatch requires 64-bit topk indices");
