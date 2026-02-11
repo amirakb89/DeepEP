@@ -173,6 +173,14 @@ __device__  __forceinline__ void st_release_sys_global(const int *ptr, int val) 
 #endif
 }
 
+__device__  __forceinline__ void st_release_sys_global(const int64_t *ptr, int val) {
+#ifdef USE_ROCM
+    __hip_atomic_store(const_cast<int64_t*>(ptr), val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    asm volatile("st.release.sys.global.s32 [%0], %1;"::"l"(ptr), "r"(val) : "memory");
+#endif
+}
+
 // __device__  __forceinline__ void st_release_cta(const int *ptr, int val) {
 //  asm volatile("st.release.cta.s32 [%0], %1;"::"l"(ptr), "r"(val) : "memory");
 // }
@@ -192,6 +200,11 @@ __device__ __forceinline__ int ld_relaxed_sys_global(const int *ptr) {
 }
 __device__ __forceinline__ int ld_relaxed_sys_global(const uint64_t *ptr) {
     uint64_t ret;
+    ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    return ret;
+}
+__device__ __forceinline__ int ld_relaxed_sys_global(const int64_t *ptr) {
+    int64_t ret;
     ret = __hip_atomic_load(ptr, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
     return ret;
 }
@@ -810,6 +823,4 @@ template <typename dtype_t>
 __host__ __device__ constexpr dtype_t align_down(dtype_t a, dtype_t b) {
     return a / b * b;
 }
-
-
 
