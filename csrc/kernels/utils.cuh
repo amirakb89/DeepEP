@@ -234,9 +234,27 @@ __device__ __forceinline__ uint64_t ld_acquire_sys_global(const uint64_t *ptr) {
 #endif
     return ret;
 }
+__device__ __forceinline__ int64_t ld_acquire_sys_global(const int64_t *ptr) {
+    int64_t ret;
+#ifdef USE_ROCM
+    ret = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+#else
+    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(ret) : "l"(ptr));
+#endif
+    return ret;
+}
 //inter
 __device__ __forceinline__ int ld_acquire_global(const int *ptr) {
     int ret;
+#ifdef USE_ROCM
+    ret = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
+#else    
+    asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+#endif
+    return ret;
+}
+__device__ __forceinline__ int ld_acquire_global(const int64_t *ptr) {
+    int64_t ret;
 #ifdef USE_ROCM
     ret = __hip_atomic_load(ptr, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT);
 #else    
@@ -823,4 +841,3 @@ template <typename dtype_t>
 __host__ __device__ constexpr dtype_t align_down(dtype_t a, dtype_t b) {
     return a / b * b;
 }
-
