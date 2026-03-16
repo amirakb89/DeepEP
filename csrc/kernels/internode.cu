@@ -4,15 +4,20 @@
 #include "buffer.cuh"
 #include "configs.cuh"
 #include "exception.cuh"
+#ifndef USE_ROCM
 #include "ibgda_device.cuh"
+#endif
 #include "launch.cuh"
 #include "utils.cuh"
+#ifdef USE_ROCM
+#include "shmem_wrapper.cuh"
+#endif
 
 namespace deep_ep {
 
 namespace internode {
 
-extern nvshmem_team_t cpu_rdma_team;
+extern shmem_team_t cpu_rdma_team;
 
 struct SourceMeta {
     int src_rdma_rank, is_token_in_nvl_rank_bits;
@@ -85,8 +90,19 @@ __forceinline__ __device__ int translate_dst_rdma_rank(const int dst_rdma_rank, 
 }
 
 template <bool kLowLatencyMode>
-__forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const nvshmem_team_t& rdma_team) {
-    kLowLatencyMode ? void(nvshmem_sync(rdma_team)) : nvshmem_sync_all();
+__forceinline__ __device__ void nvshmem_sync_with_same_gpu_idx(const shmem_team_t& rdma_team) {
+#ifdef USE_ROCM
+    kLowLatencyMode ? void(shmem_barrier(rdma_team)) : shmem_device_barrier_all();
+#else
+    kLowLatencyMode ? void(shmem_sync(rdma_team)) : nvshmem_sync_all();
+#endif
+}
+
+template <bool kLowLatencyMode>
+__forceinline__ __device__ void nvshmem_barrier_with_same_gpu_idx(const shmem_team_t& rdma_team) {
+    // NOTE: shmem_device_barrier_all() might be an issue as 
+    // it doesn't follow OpenSHMEM specification on ROCm
+    kLowLatencyMode ? void(shmem_barrier(rdma_team)) : shmem_device_barrier_all();
 }
 
 template <bool kLowLatencyMode, int kNumRDMARanks>
@@ -115,7 +131,7 @@ __global__ void notify_dispatch(const int* num_tokens_per_rank,
                                 void** buffer_ptrs,
                                 int** barrier_signal_ptrs,
                                 int rank,
-                                const nvshmem_team_t rdma_team) {
+                                const shmem_team_t rdma_team) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
     auto num_threads = static_cast<int>(blockDim.x), num_warps = num_threads / 32;
@@ -1324,7 +1340,7 @@ __global__ void cached_notify(const int rdma_clean_offset,
                               int rank,
                               int num_ranks,
                               bool is_cached_dispatch,
-                              const nvshmem_team_t rdma_team) {
+                              const shmem_team_t rdma_team) {
     auto sm_id = static_cast<int>(blockIdx.x);
     auto thread_id = static_cast<int>(threadIdx.x);
     auto num_threads = static_cast<int>(blockDim.x);
