@@ -21,6 +21,43 @@ __device__ __forceinline__ void pseudo_random_sleep() {
     }
 }
 
+#ifdef USE_ROCM
+struct WorkgroupWarpBarrier {
+    int count;
+    int phase;
+};
+
+__device__ __forceinline__ void init_workgroup_warp_barrier(volatile WorkgroupWarpBarrier* barrier) {
+    barrier->count = 0;
+    barrier->phase = 0;
+}
+
+__device__ __forceinline__ void wait_workgroup_warp_barrier(volatile WorkgroupWarpBarrier* barrier,
+                                                            int expected_warps,
+                                                            bool is_warp_leader) {
+    syncwarp();
+    if (is_warp_leader) {
+        const int phase = barrier->phase;
+        __threadfence_block();
+        const int ticket = __hip_atomic_fetch_add(reinterpret_cast<int*>((void*)&barrier->count),
+                                                  1,
+                                                  __ATOMIC_ACQ_REL,
+                                                  __HIP_MEMORY_SCOPE_WORKGROUP);
+        if (ticket == expected_warps - 1) {
+            barrier->count = 0;
+            __threadfence_block();
+            barrier->phase = phase ^ 1;
+            __threadfence_block();
+        } else {
+            while (barrier->phase == phase)
+                __builtin_amdgcn_s_sleep(1);
+            __threadfence_block();
+        }
+    }
+    syncwarp();
+}
+#endif
+
 template<int kNumThreads, int kNumExpertsPerSM, int kNumRanksPerSM>
 __global__ void __launch_bounds__(kNumThreads, 1)
 get_dispatch_layout(const int64_t* topk_idx,
@@ -1693,11 +1730,6 @@ combine(int4* combined_x, float* combined_topk_weights,
         kCoordinator
     };
 
-#if !defined(ROCM_DISABLE_CTX)
-    __shared__ shmem_ctx_t ctx;
-    shmem_wg_ctx_create(&ctx);
-#endif
-
     void* original_rdma_buffer_ptr = rdma_buffer_ptr;
     //void* original_atomic_buffer_ptr = atomic_buffer_ptr;
     auto const sm_id = static_cast<int>(blockIdx.x);
@@ -1748,11 +1780,23 @@ combine(int4* combined_x, float* combined_topk_weights,
     auto num_max_nvl_chunked_recv_tokens_per_rdma =
       num_max_nvl_chunked_recv_tokens / kNumRDMARanks;
 
-#if defined(USE_ROCM)
-    //TODO:: check amd_barrier
-    //for (int i = thread_id; i < MAX_NUM_BARRIERS; i += num_threads)
-    //amd::barrier_init(i);
-  __syncthreads();
+#ifdef USE_ROCM
+    __syncthreads();
+    __shared__ volatile WorkgroupWarpBarrier combine_forwarder_barrier;
+    __shared__ volatile WorkgroupWarpBarrier combine_rdma_receiver_barrier;
+    __shared__ volatile WorkgroupWarpBarrier combine_large_warp_barriers[kNumRDMARanks];
+    if (threadIdx.x == 0) {
+        init_workgroup_warp_barrier(&combine_forwarder_barrier);
+        init_workgroup_warp_barrier(&combine_rdma_receiver_barrier);
+#pragma unroll
+        for (int bi = 0; bi < kNumRDMARanks; ++bi)
+            init_workgroup_warp_barrier(&combine_large_warp_barriers[bi]);
+    }
+    __syncthreads();
+#if !defined(ROCM_DISABLE_CTX)
+    __shared__ shmem_ctx_t ctx;
+    shmem_wg_ctx_create(&ctx);
+#endif
 #endif
 
     if (warp_role == WarpRole::kNVLSender) {
@@ -1763,7 +1807,9 @@ combine(int4* combined_x, float* combined_topk_weights,
         // NOTES: to avoid deadlocks, we use separate NVL buffers for different RDMA
         // sources
         auto dst_buffer_ptr = buffer_ptrs[dst_nvl_rank], local_buffer_ptr = buffer_ptrs[nvl_rank];
-        auto nvl_channel_x = AsymBuffer<uint8_t>(dst_buffer_ptr, num_max_nvl_chunked_recv_tokens * num_bytes_per_token, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank).advance_also(local_buffer_ptr);
+        auto nvl_channel_x = AsymBuffer<int4>(dst_buffer_ptr, num_max_nvl_chunked_recv_tokens * hidden_int4, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank).advance_also(local_buffer_ptr);
+        auto nvl_channel_src_meta = AsymBuffer<SourceMeta>(dst_buffer_ptr, num_max_nvl_chunked_recv_tokens, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank).advance_also(local_buffer_ptr);
+        auto nvl_channel_topk_weights = AsymBuffer<float>(dst_buffer_ptr, num_max_nvl_chunked_recv_tokens * num_topk, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank).advance_also(local_buffer_ptr);
         auto nvl_channel_head = AsymBuffer<int>(local_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, dst_nvl_rank).advance_also(dst_buffer_ptr);
         auto nvl_channel_tail = AsymBuffer<int>(dst_buffer_ptr, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank).advance_also(local_buffer_ptr);
 
@@ -1839,25 +1885,22 @@ combine(int4* combined_x, float* combined_topk_weights,
                     dst_slot_idx = __shfl_sync(kFullWarpMask, dst_slot_idx, current_rdma_idx);
 
                     // Load data
-                    auto shifted_x_buffers =  nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
                     auto shifted_x = x + token_idx * hidden_int4;
 
 #if defined(USE_ROCM)
                     // Copy data
                     UNROLLED_WARP_COPY(5, lane_id, hidden_int4,
-                                        reinterpret_cast<int4*>(shifted_x_buffers),
+                                        nvl_channel_x.buffer() + dst_slot_idx * hidden_int4,
                                         shifted_x, ld_nc_global, st_na_global);
 
                     // Copy source meta
                     if (lane_id == num_topk)
-                        st_na_global(
-                            reinterpret_cast<SourceMeta*>(shifted_x_buffers + hidden_bytes),
+                        st_na_global(nvl_channel_src_meta.buffer() + dst_slot_idx,
                             ld_nc_global(src_meta + token_idx));
 
                     // Copy `topk_weights`
                     if (lane_id < num_topk)
-                        st_na_global(reinterpret_cast<float*>(shifted_x_buffers + hidden_bytes +
-                                                    sizeof(SourceMeta) + lane_id * sizeof(float)),
+                        st_na_global(nvl_channel_topk_weights.buffer() + dst_slot_idx * num_topk + lane_id,
                             ld_nc_global(topk_weights + token_idx * num_topk + lane_id));
 #endif
                 }
@@ -1884,9 +1927,11 @@ combine(int4* combined_x, float* combined_topk_weights,
     void* nvl_buffers[NUM_MAX_NVL_PEERS];
 #pragma unroll
     for (int i = 0; i < NUM_MAX_NVL_PEERS; ++i) nvl_buffers[i] = buffer_ptrs[i];
-    auto nvl_channel_x = AsymBuffer<uint8_t>( local_nvl_buffer, num_max_nvl_chunked_recv_tokens * num_bytes_per_token, NUM_MAX_NVL_PEERS, channel_id, num_channels).advance_also<NUM_MAX_NVL_PEERS>(nvl_buffers);
-    auto nvl_channel_head = AsymBuffer<int, NUM_MAX_NVL_PEERS>(nvl_buffers, kNumRDMARanks, NUM_MAX_NVL_PEERS,channel_id, num_channels, nvl_rank).advance_also(local_nvl_buffer);
-    auto nvl_channel_tail = AsymBuffer<int>(local_nvl_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS,channel_id, num_channels).advance_also<NUM_MAX_NVL_PEERS>(nvl_buffers);
+    auto nvl_channel_x = AsymBuffer<int4>(local_nvl_buffer, num_max_nvl_chunked_recv_tokens * hidden_int4, NUM_MAX_NVL_PEERS, channel_id, num_channels).advance_also<NUM_MAX_NVL_PEERS>(nvl_buffers);
+    auto nvl_channel_src_meta = AsymBuffer<SourceMeta>(local_nvl_buffer, num_max_nvl_chunked_recv_tokens, NUM_MAX_NVL_PEERS, channel_id, num_channels).advance_also<NUM_MAX_NVL_PEERS>(nvl_buffers);
+    auto nvl_channel_topk_weights = AsymBuffer<float>(local_nvl_buffer, num_max_nvl_chunked_recv_tokens * num_topk, NUM_MAX_NVL_PEERS, channel_id, num_channels).advance_also<NUM_MAX_NVL_PEERS>(nvl_buffers);
+    auto nvl_channel_head = AsymBuffer<int, NUM_MAX_NVL_PEERS>(nvl_buffers, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels, nvl_rank).advance_also(local_nvl_buffer);
+    auto nvl_channel_tail = AsymBuffer<int>(local_nvl_buffer, kNumRDMARanks, NUM_MAX_NVL_PEERS, channel_id, num_channels).advance_also<NUM_MAX_NVL_PEERS>(nvl_buffers);
 
     // Combiner warp synchronization
     __shared__ int volatile forwarder_nvl_head[kNumForwarders]
@@ -1897,21 +1942,17 @@ combine(int4* combined_x, float* combined_topk_weights,
     __shared__ bool volatile rdma_receiver_retired[kNumRDMAReceivers];
 
     auto sync_forwarder_smem = [=]() {
-#if defined(USE_ROCM)
-    //sync_barrier(0, kNumForwarders * kWarpSize);
-    syncwarp();
+#ifdef USE_ROCM
+        wait_workgroup_warp_barrier(&combine_forwarder_barrier, kNumForwarders, lane_id == 0);
 #else
-    //sync_barrier(0, (kNumForwarders + 1) * kWarpSize);
-    syncwarp();
+        asm volatile("barrier.sync 0, %0;" ::"r"((kNumForwarders + 1) * kWarpSize));
 #endif
     };
     auto sync_rdma_receiver_smem = [=]() {
-#if defined(USE_ROCM)
-    //sync_barrier_1(kNumRDMAReceivers * kWarpSize);
-    syncwarp();
+#ifdef USE_ROCM
+        wait_workgroup_warp_barrier(&combine_rdma_receiver_barrier, kNumRDMAReceivers, lane_id == 0);
 #else
-    //sync_barrier_1((kNumRDMAReceivers + 1) * kWarpSize);
-    syncwarp();
+        asm volatile("barrier.sync 1, %0;" ::"r"((kNumRDMAReceivers + 1) * kWarpSize));
 #endif
     };
     
@@ -1951,8 +1992,12 @@ combine(int4* combined_x, float* combined_topk_weights,
         if (kNumWarpsPerForwarder == 1) {
             syncwarp();
         } else {
-            __syncthreads();
-            //sync_barrier(dst_rdma_rank + 2, kNumWarpsPerForwarder * kWarpSize);
+#ifdef USE_ROCM
+            wait_workgroup_warp_barrier(&combine_large_warp_barriers[dst_rdma_rank],
+                                        kNumWarpsPerForwarder, lane_id == 0);
+#else
+            asm volatile("bar.sync %0, %1;" ::"r"(dst_rdma_rank + 2), "r"(kNumWarpsPerForwarder * kWarpSize));
+#endif
         }
       };
       EP_STATIC_ASSERT(kNumWarpsPerForwarder == 1 or kNumRDMARanks + 2 <= 16,
@@ -1986,9 +2031,9 @@ combine(int4* combined_x, float* combined_topk_weights,
 #endif
 
       // Advance to the corresponding NVL buffer
-      nvl_channel_x.advance(dst_rdma_rank *
-                            num_max_nvl_chunked_recv_tokens_per_rdma *
-                            num_bytes_per_token);
+      nvl_channel_x.advance(dst_rdma_rank * num_max_nvl_chunked_recv_tokens_per_rdma * hidden_int4);
+      nvl_channel_src_meta.advance(dst_rdma_rank * num_max_nvl_chunked_recv_tokens_per_rdma);
+      nvl_channel_topk_weights.advance(dst_rdma_rank * num_max_nvl_chunked_recv_tokens_per_rdma * num_topk);
       nvl_channel_head.advance(dst_rdma_rank);
       nvl_channel_tail.advance(dst_rdma_rank);
 
@@ -2099,17 +2144,14 @@ combine(int4* combined_x, float* combined_topk_weights,
           void* shifted = send_buffer + rdma_slot_idx * num_bytes_per_token;
           auto get_addr_fn = [&](int src_nvl_rank, int slot_idx,
                                  int hidden_int4_idx) -> int4* {
-            return reinterpret_cast<int4*>(nvl_channel_x.buffer(src_nvl_rank) +
-                                           slot_idx * num_bytes_per_token) +
-                   hidden_int4_idx;
+            return nvl_channel_x.buffer(src_nvl_rank) +
+                   slot_idx * hidden_int4 + hidden_int4_idx;
           };
           auto recv_tw_fn = [&](int src_nvl_rank, int slot_idx,
                                 int topk_idx) -> float {
             return ld_nc_global(
-                reinterpret_cast<float*>(nvl_channel_x.buffer(src_nvl_rank) +
-                                         slot_idx * num_bytes_per_token +
-                                         hidden_bytes + sizeof(SourceMeta)) +
-                topk_idx);
+                nvl_channel_topk_weights.buffer(src_nvl_rank) +
+                slot_idx * num_topk + topk_idx);
           };
 
 #if defined(USE_ROCM)
@@ -2164,11 +2206,11 @@ combine(int4* combined_x, float* combined_topk_weights,
                                                 num_chunked_tokens * num_bytes_per_token,
                                                 translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank));
 #endif
-// #if defined(ROCM_DISABLE_CTX)
-//                         shmem_fence();
-// #else
-//                         shmem_ctx_quiet(ctx);
-// #endif
+#if defined(ROCM_DISABLE_CTX)
+                        shmem_fence();
+#else
+                        shmem_ctx_quiet(ctx);
+#endif
 //             uccl::nvshmemi_ibgda_put_nbi_warp</*use_normal_mode=*/true>(
 //                 dst_ptr - reinterpret_cast<uint64_t>(original_rdma_buffer_ptr),
 //                 src_ptr - reinterpret_cast<uint64_t>(original_rdma_buffer_ptr),
